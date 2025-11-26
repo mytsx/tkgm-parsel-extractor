@@ -6,7 +6,7 @@ TKGM (Tapu ve Kadastro Genel Mudurlugu) API'sinden belirli bir alan icindeki tum
 ![PyQt5](https://img.shields.io/badge/PyQt5-Fluent%20UI-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ArcaScript/tkgm-parsel-extractor)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mytsx/tkgm-parsel-extractor)
 
 ## Ozellikler
 

@@ -137,15 +137,17 @@ class ScanWorker(QThread):
             points = self.generate_grid_points(polygon)
             all_points.extend(points)
 
-        self.log.emit(f"Toplam {len(all_points)} nokta taranacak")
+        total_points = len(all_points)
+        remaining_points = set(all_points)
+        self.log.emit(f"Toplam {total_points} nokta taranacak")
 
         found_count = 0
         found_ids = set()
+        processed = 0
 
-        for i, (lat, lon) in enumerate(all_points):
-            if not self.is_running:
-                self.log.emit("Tarama durduruldu")
-                break
+        while remaining_points and self.is_running:
+            lat, lon = remaining_points.pop()
+            processed += 1
 
             result = self.client.get_parsel(lat, lon)
 
@@ -158,9 +160,28 @@ class ScanWorker(QThread):
                     props = result['properties']
                     self.log.emit(f"✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
 
-            self.progress.emit(i + 1, len(all_points))
+                    # Geometri bazli eleme: Bu parselin icine dusen noktalari cikar
+                    if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
+                        coords = result['geometry'].get('coordinates', [[]])[0]
+                        # TKGM [lon, lat] formatinda, biz (lat, lon) kullaniyoruz
+                        parcel_poly = [(c[1], c[0]) for c in coords]
+
+                        points_to_remove = set()
+                        for p in remaining_points:
+                            if KMLParser.point_in_polygon(p[0], p[1], parcel_poly):
+                                points_to_remove.add(p)
+
+                        if points_to_remove:
+                            remaining_points -= points_to_remove
+                            self.log.emit(f"  ↳ {len(points_to_remove)} nokta elendi (parsel icinde)")
+
+            self.progress.emit(total_points - len(remaining_points), total_points)
             time.sleep(self.delay)
 
+        if not self.is_running:
+            self.log.emit("Tarama durduruldu")
+
+        self.log.emit(f"Toplam {processed} sorgu yapildi ({total_points - processed} sorgu tasarruf edildi)")
         self.finished_scan.emit(found_count)
 
     def generate_grid_points(self, polygon):

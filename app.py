@@ -541,7 +541,22 @@ class MainWindow(QMainWindow):
             coords = geom.get('coordinates', [[]])[0]
             coord_str = ' '.join([f"{c[0]},{c[1]},0" for c in coords])
             name = props.get('ozet', pid)
-            kml += f'<Placemark><name>{name}</name><styleUrl>#s</styleUrl>'
+
+            # Detayli aciklama
+            desc = f"""<![CDATA[
+<b>Il:</b> {props.get('ilAd', '-')}<br/>
+<b>Ilce:</b> {props.get('ilceAd', '-')}<br/>
+<b>Mahalle:</b> {props.get('mahalleAd', '-')}<br/>
+<b>Mevkii:</b> {props.get('mevkii', '-')}<br/>
+<b>Ada No:</b> {props.get('adaNo', '-')}<br/>
+<b>Parsel No:</b> {props.get('parselNo', '-')}<br/>
+<b>Pafta:</b> {props.get('pafta', '-')}<br/>
+<b>Alan:</b> {props.get('alan', '-')} m²<br/>
+<b>Nitelik:</b> {props.get('nitelik', '-')}<br/>
+<b>Durum:</b> {props.get('zeminKmdurum', '-')}
+]]>"""
+
+            kml += f'<Placemark><name>{name}</name><description>{desc}</description><styleUrl>#s</styleUrl>'
             kml += f'<Polygon><outerBoundaryIs><LinearRing><coordinates>{coord_str}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>\n'
 
         kml += '</Document></kml>'

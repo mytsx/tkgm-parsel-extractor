@@ -1,0 +1,7 @@
+name = "tkgm-parsel-proxy"
+main = "cloudflare-worker.js"
+compatibility_date = "2024-01-01"
+
+# Workers ucretsiz plan limitleri:
+# - 100,000 istek/gun
+# - 10ms CPU time/istek

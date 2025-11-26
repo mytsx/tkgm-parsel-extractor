@@ -1,0 +1,126 @@
+// Cloudflare Worker - TKGM API Proxy
+// Bu worker'ı Cloudflare Dashboard'da deploy edin
+
+export default {
+  async fetch(request, env, ctx) {
+    // CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        },
+      });
+    }
+
+    const url = new URL(request.url);
+
+    // /parsel/lat/lon endpoint'i
+    if (url.pathname.startsWith("/parsel/")) {
+      const parts = url.pathname.split("/");
+      const lat = parts[2];
+      const lon = parts[3];
+
+      if (!lat || !lon) {
+        return new Response(JSON.stringify({ error: "lat ve lon parametreleri gerekli" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      const tkgmUrl = `https://cbsapi.tkgm.gov.tr/megsiswebapi.v3.1/api/parsel/${lat}/${lon}/`;
+
+      try {
+        const response = await fetch(tkgmUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://parselsorgu.tkgm.gov.tr/",
+            "Origin": "https://parselsorgu.tkgm.gov.tr"
+          }
+        });
+
+        const data = await response.text();
+
+        return new Response(data, {
+          status: response.status,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "X-Proxied-By": "cloudflare-worker"
+          }
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    // /batch endpoint'i - toplu sorgu
+    if (url.pathname === "/batch" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const coordinates = body.coordinates; // [{lat, lon}, ...]
+
+        if (!coordinates || !Array.isArray(coordinates)) {
+          return new Response(JSON.stringify({ error: "coordinates array gerekli" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        const results = await Promise.all(
+          coordinates.map(async (coord, index) => {
+            // Küçük delay ekle (rate limit için)
+            await new Promise(r => setTimeout(r, index * 100));
+
+            const tkgmUrl = `https://cbsapi.tkgm.gov.tr/megsiswebapi.v3.1/api/parsel/${coord.lat}/${coord.lon}/`;
+
+            try {
+              const response = await fetch(tkgmUrl, {
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "Accept": "application/json",
+                  "Referer": "https://parselsorgu.tkgm.gov.tr/",
+                  "Origin": "https://parselsorgu.tkgm.gov.tr"
+                }
+              });
+
+              if (response.ok) {
+                return await response.json();
+              }
+              return { error: `HTTP ${response.status}`, coord };
+            } catch (e) {
+              return { error: e.message, coord };
+            }
+          })
+        );
+
+        return new Response(JSON.stringify({ results, count: results.length }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+          }
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({
+      message: "TKGM Proxy API",
+      endpoints: {
+        parsel: "GET /parsel/{lat}/{lon}",
+        batch: "POST /batch with {coordinates: [{lat, lon}, ...]}"
+      }
+    }), {
+      headers: { "Content-Type": "application/json" }
+    });
+  },
+};

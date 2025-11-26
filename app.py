@@ -120,6 +120,39 @@ class TKGMClient:
         except Exception as e:
             return None, str(e)
 
+    def get_batch(self, coordinates: list) -> tuple:
+        """
+        Batch sorgu - birden fazla koordinati tek istekte sorgula
+        Args:
+            coordinates: [(lat, lon), (lat, lon), ...] listesi
+        Returns:
+            (results_list, error_code) tuple
+            results_list: [{data}, {data}, ...] veya None'lar
+        """
+        try:
+            url = f"{self.worker_url}/batch"
+            payload = {
+                "coordinates": [{"lat": c[0], "lon": c[1]} for c in coordinates]
+            }
+            response = self.session.post(url, json=payload, timeout=120)
+
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get('results', [])
+                # Her sonucu kontrol et, gecerli parsel mi?
+                processed = []
+                for r in results:
+                    if r and isinstance(r, dict) and 'properties' in r:
+                        processed.append(r)
+                    else:
+                        processed.append(None)
+                return processed, None
+            elif response.status_code == 401:
+                return None, 401
+            return None, response.status_code
+        except Exception as e:
+            return None, str(e)
+
 
 # ==================== WORKER THREAD ====================
 
@@ -139,24 +172,31 @@ class ScanWorker(QThread):
         self.is_running = True
 
     def run(self):
+        BATCH_SIZE = 15  # Her batch'te kac nokta sorgulanacak
+
         all_points = []
         for polygon in self.polygons:
             points = self.generate_grid_points(polygon)
             all_points.extend(points)
 
         total_points = len(all_points)
-        remaining_points = set(all_points)
-        self.log.emit(f"Toplam {total_points} nokta taranacak")
+        remaining_points = list(all_points)  # Liste olarak tut (batch icin)
+        self.log.emit(f"Toplam {total_points} nokta taranacak (batch size: {BATCH_SIZE})")
 
         found_count = 0
         found_ids = set()
-        processed = 0
+        api_calls = 0
+        total_pruned = 0
 
         while remaining_points and self.is_running:
-            lat, lon = remaining_points.pop()
-            processed += 1
+            # Batch icin noktalari al
+            batch_points = remaining_points[:BATCH_SIZE]
+            remaining_points = remaining_points[BATCH_SIZE:]
 
-            result, error = self.client.get_parsel(lat, lon)
+            api_calls += 1
+            self.log.emit(f"Batch #{api_calls}: {len(batch_points)} nokta sorgulanıyor...")
+
+            results, error = self.client.get_batch(batch_points)
 
             # 401 Unauthorized hatasi
             if error == 401:
@@ -164,37 +204,63 @@ class ScanWorker(QThread):
                 self.auth_error.emit()
                 break
 
-            if result and 'properties' in result:
-                parsel_id = result['properties'].get('ozet', f"{lat}_{lon}")
-                if parsel_id not in found_ids:
-                    found_ids.add(parsel_id)
-                    found_count += 1
-                    self.parcel_found.emit(parsel_id, result)
-                    props = result['properties']
-                    self.log.emit(f"✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
+            if error:
+                self.log.emit(f"  Batch hatasi: {error}")
+                continue
 
-                    # Geometri bazli eleme: Bu parselin icine dusen noktalari cikar
+            if not results:
+                continue
+
+            # Batch sonuclarini isle
+            new_parcels_in_batch = []
+            for i, result in enumerate(results):
+                if result and 'properties' in result:
+                    parsel_id = result['properties'].get('ozet', f"unknown_{i}")
+                    if parsel_id not in found_ids:
+                        found_ids.add(parsel_id)
+                        found_count += 1
+                        new_parcels_in_batch.append(result)
+                        self.parcel_found.emit(parsel_id, result)
+                        props = result['properties']
+                        self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
+
+            # Batch sonrasi pruning: Bulunan parsellerin icine dusen noktalari ele
+            if new_parcels_in_batch:
+                pruned_in_batch = 0
+                for result in new_parcels_in_batch:
                     if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
                         coords = result['geometry'].get('coordinates', [[]])[0]
-                        # TKGM [lon, lat] formatinda, biz (lat, lon) kullaniyoruz
                         parcel_poly = [(c[1], c[0]) for c in coords]
 
-                        points_to_remove = set()
+                        # Kalan noktalardan bu parselin icine dusenleri bul
+                        new_remaining = []
                         for p in remaining_points:
-                            if KMLParser.point_in_polygon(p[0], p[1], parcel_poly):
-                                points_to_remove.add(p)
+                            if not KMLParser.point_in_polygon(p[0], p[1], parcel_poly):
+                                new_remaining.append(p)
+                            else:
+                                pruned_in_batch += 1
 
-                        if points_to_remove:
-                            remaining_points -= points_to_remove
-                            self.log.emit(f"  ↳ {len(points_to_remove)} nokta elendi (parsel icinde)")
+                        remaining_points = new_remaining
 
-            self.progress.emit(total_points - len(remaining_points), total_points)
+                if pruned_in_batch > 0:
+                    total_pruned += pruned_in_batch
+                    self.log.emit(f"  ↳ {pruned_in_batch} nokta elendi (parseller icinde)")
+
+            # Progress guncelle
+            processed = total_points - len(remaining_points)
+            self.progress.emit(processed, total_points)
+
+            # Batch arasi bekleme
             time.sleep(self.delay)
 
         if not self.is_running:
             self.log.emit("Tarama durduruldu")
 
-        self.log.emit(f"Toplam {processed} sorgu yapildi ({total_points - processed} sorgu tasarruf edildi)")
+        self.log.emit(f"\n{'='*50}")
+        self.log.emit(f"SONUC: {found_count} parsel bulundu")
+        self.log.emit(f"API cagrilari: {api_calls} batch ({api_calls * BATCH_SIZE} yerine)")
+        self.log.emit(f"Elenen noktalar: {total_pruned}")
+        self.log.emit(f"Tasarruf: ~{((total_points - api_calls) / total_points * 100):.1f}%")
         self.finished_scan.emit(found_count)
 
     def generate_grid_points(self, polygon):

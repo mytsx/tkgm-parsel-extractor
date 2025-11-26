@@ -74,7 +74,7 @@ export default {
       }
     }
 
-    // /batch endpoint'i - toplu sorgu
+    // /batch endpoint'i - toplu sorgu (optimize edilmis)
     if (url.pathname === "/batch" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -87,10 +87,15 @@ export default {
           });
         }
 
+        // Max 20 koordinat limiti (TKGM rate limit icin)
+        const limitedCoords = coordinates.slice(0, 20);
+
         const results = await Promise.all(
-          coordinates.map(async (coord, index) => {
-            // Küçük delay ekle (rate limit için)
-            await new Promise(r => setTimeout(r, index * 100));
+          limitedCoords.map(async (coord, index) => {
+            // Staggered delay: ilk 5 aninda, sonrakiler 50ms arayla
+            if (index >= 5) {
+              await new Promise(r => setTimeout(r, (index - 5) * 50));
+            }
 
             const tkgmUrl = `https://cbsapi.tkgm.gov.tr/megsiswebapi.v3.1/api/parsel/${coord.lat}/${coord.lon}/`;
 
@@ -105,16 +110,26 @@ export default {
               });
 
               if (response.ok) {
-                return await response.json();
+                const data = await response.json();
+                // Basarili sonucu dondur
+                return data;
               }
-              return { error: `HTTP ${response.status}`, coord };
+              // Bos/hata durumunda null dondur
+              return null;
             } catch (e) {
-              return { error: e.message, coord };
+              return null;
             }
           })
         );
 
-        return new Response(JSON.stringify({ results, count: results.length }), {
+        // Basarili sonuclari say
+        const successCount = results.filter(r => r && r.properties).length;
+
+        return new Response(JSON.stringify({
+          results,
+          count: results.length,
+          success: successCount
+        }), {
           headers: {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*"

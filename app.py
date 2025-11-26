@@ -94,25 +94,31 @@ class KMLParser:
 # ==================== TKGM CLIENT ====================
 
 class TKGMClient:
-    def __init__(self, worker_url: str):
+    def __init__(self, worker_url: str, api_key: str = None):
         self.worker_url = worker_url.rstrip('/')
+        self.api_key = api_key
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
         })
+        if api_key:
+            self.session.headers["X-API-Key"] = api_key
 
-    def get_parsel(self, lat: float, lon: float) -> Optional[Dict]:
+    def get_parsel(self, lat: float, lon: float) -> tuple:
+        """Returns (data, error_code) tuple"""
         try:
             url = f"{self.worker_url}/parsel/{lat}/{lon}"
             response = self.session.get(url, timeout=30)
             if response.status_code == 200:
                 data = response.json()
                 if 'properties' in data:
-                    return data
-            return None
-        except:
-            return None
+                    return data, None
+            elif response.status_code == 401:
+                return None, 401
+            return None, response.status_code
+        except Exception as e:
+            return None, str(e)
 
 
 # ==================== WORKER THREAD ====================
@@ -122,6 +128,7 @@ class ScanWorker(QThread):
     log = pyqtSignal(str)
     parcel_found = pyqtSignal(str, dict)
     finished_scan = pyqtSignal(int)
+    auth_error = pyqtSignal()  # 401 hatasi icin
 
     def __init__(self, client: TKGMClient, polygons: List, step_meters: int, delay: float):
         super().__init__()
@@ -149,7 +156,13 @@ class ScanWorker(QThread):
             lat, lon = remaining_points.pop()
             processed += 1
 
-            result = self.client.get_parsel(lat, lon)
+            result, error = self.client.get_parsel(lat, lon)
+
+            # 401 Unauthorized hatasi
+            if error == 401:
+                self.log.emit("HATA: API Key hatali veya eksik (401 Unauthorized)")
+                self.auth_error.emit()
+                break
 
             if result and 'properties' in result:
                 parsel_id = result['properties'].get('ozet', f"{lat}_{lon}")
@@ -244,6 +257,13 @@ class MainWindow(QMainWindow):
         self.worker_url_input = LineEdit()
         self.worker_url_input.setPlaceholderText("https://your-worker.workers.dev")
         url_layout.addWidget(self.worker_url_input)
+
+        # API Key (Opsiyonel)
+        url_layout.addWidget(BodyLabel("API Key (Opsiyonel)"))
+        self.api_key_input = LineEdit()
+        self.api_key_input.setPlaceholderText("Bos birakilabilir - Worker herkese acik olur")
+        url_layout.addWidget(self.api_key_input)
+
         layout.addWidget(url_card)
 
         # KML Card
@@ -346,6 +366,10 @@ class MainWindow(QMainWindow):
         if url:
             self.worker_url_input.setText(url)
 
+        api_key = self.settings.value("api_key", "")
+        if api_key:
+            self.api_key_input.setText(api_key)
+
         step = self.settings.value("step_meters", 30, type=int)
         self.step_spin.setValue(step)
 
@@ -354,6 +378,7 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         self.settings.setValue("worker_url", self.worker_url_input.text())
+        self.settings.setValue("api_key", self.api_key_input.text())
         self.settings.setValue("step_meters", self.step_spin.value())
         self.settings.setValue("delay", self.delay_spin.value())
 
@@ -434,7 +459,19 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
-        client = TKGMClient(url)
+        api_key = self.api_key_input.text().strip() or None
+        client = TKGMClient(url, api_key)
+
+        # API Key uyarisi
+        if not api_key:
+            InfoBar.info(
+                title="Bilgi",
+                content="API Key girilmedi - Worker herkese acik",
+                parent=self,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=3000
+            )
+
         self.worker = ScanWorker(
             client,
             self.polygons,
@@ -445,6 +482,7 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self.log)
         self.worker.parcel_found.connect(self.on_parcel_found)
         self.worker.finished_scan.connect(self.on_finished)
+        self.worker.auth_error.connect(self.on_auth_error)
         self.worker.start()
 
         self.log("Tarama baslatildi...")
@@ -461,6 +499,19 @@ class MainWindow(QMainWindow):
 
     def on_parcel_found(self, parsel_id: str, data: dict):
         self.parcels[parsel_id] = data
+
+    def on_auth_error(self):
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText("Hata - API Key hatali")
+
+        InfoBar.error(
+            title="API Key Hatasi",
+            content="API Key hatali veya eksik. Worker'da API_KEY tanimliysa ayni key'i girin.",
+            parent=self,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=8000
+        )
 
     def on_finished(self, count: int):
         self.start_btn.setEnabled(True)

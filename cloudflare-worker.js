@@ -9,9 +9,24 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
         },
       });
+    }
+
+    // Opsiyonel API Key kontrolu
+    // Cloudflare Dashboard > Worker > Settings > Variables > API_KEY ekleyin
+    if (env.API_KEY) {
+      const providedKey = request.headers.get("X-API-Key");
+      if (providedKey !== env.API_KEY) {
+        return new Response(JSON.stringify({ error: "Unauthorized - Invalid API Key" }), {
+          status: 401,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+          }
+        });
+      }
     }
 
     const url = new URL(request.url);

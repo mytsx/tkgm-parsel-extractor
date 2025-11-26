@@ -12,8 +12,10 @@ TKGM (Tapu ve Kadastro Genel Mudurlugu) API'sinden belirli bir alan icindeki tum
 
 - KML dosyasindan alan yukleyebilme
 - Cloudflare Workers ile rate limit bypass
+- **Akilli tarama**: Bulunan parsellerin icindeki noktalar otomatik elenir (10x-50x daha hizli)
+- **Opsiyonel API Key** korumasi
 - Modern Fluent Design arayuz
-- GeoJSON ve KML formatinda export
+- GeoJSON ve KML formatinda export (tum parsel bilgileri dahil)
 - Ilerleme takibi ve log
 - Ayarlari otomatik kaydetme
 
@@ -41,10 +43,22 @@ python app.py
 ## Kullanim
 
 1. Worker URL'inizi girin
-2. KML dosyanizi secin (taranacak alan)
-3. Grid araligini ayarlayin (kucuk = daha hassas, daha yavas)
-4. "Taramayi Baslat" butonuna basin
-5. Tamamlaninca "Kaydet" ile GeoJSON/KML olarak export edin
+2. API Key girin (opsiyonel - bos birakilabilir)
+3. KML dosyanizi secin (taranacak alan)
+4. Grid araligini ayarlayin (kucuk = daha hassas, daha yavas)
+5. "Taramayi Baslat" butonuna basin
+6. Tamamlaninca "Kaydet" ile GeoJSON/KML olarak export edin
+
+## API Key Korumasi (Opsiyonel)
+
+Worker'inizi korumak istiyorsaniz:
+
+1. Cloudflare Dashboard > Worker > Settings > Variables
+2. `API_KEY` adinda yeni variable ekleyin (Type: Secret)
+3. Degerini belirleyin (ornek: `my-secret-key-123`)
+4. Ayni key'i uygulamada "API Key" alanina girin
+
+**Not:** API Key eklemezseniz worker herkese acik olur. Kendi kullanim senaryonuza gore karar verin.
 
 ## EXE/APP Build
 

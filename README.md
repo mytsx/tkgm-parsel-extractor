@@ -53,12 +53,29 @@ python app.py
 
 Worker'inizi korumak istiyorsaniz:
 
-1. Cloudflare Dashboard > Worker > Settings > Variables
-2. `API_KEY` adinda yeni variable ekleyin (Type: Secret)
-3. Degerini belirleyin (ornek: `my-secret-key-123`)
-4. Ayni key'i uygulamada "API Key" alanina girin
+### Cloudflare Dashboard'dan:
+1. [Cloudflare Dashboard](https://dash.cloudflare.com) > Workers & Pages
+2. Worker'inizi secin (ornek: `tkgm-proxy`)
+3. **Settings** sekmesine tiklayin
+4. **Variables and Secrets** bolumune gidin
+5. **Add** butonuna basin
+6. Type: **Secret** secin
+7. Variable name: `API_KEY`
+8. Value: Kendiniz belirleyin (ornek: `benim-gizli-anahtarim-123`)
+9. **Save** tiklayin
 
-**Not:** API Key eklemezseniz worker herkese acik olur. Kendi kullanim senaryonuza gore karar verin.
+### Wrangler CLI ile:
+```bash
+npx wrangler secret put API_KEY
+# Sordugunda degerini girin
+```
+
+### Uygulamada:
+Ayni key'i uygulamadaki "API Key" alanina girin.
+
+**Not:** API Key tamamen opsiyoneldir. Eklemezseniz worker herkese acik olur.
+
+> Detayli bilgi: [Cloudflare Workers Secrets Dokumantasyonu](https://developers.cloudflare.com/workers/configuration/secrets/)
 
 ## EXE/APP Build
 

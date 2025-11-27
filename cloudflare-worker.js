@@ -1,6 +1,11 @@
 // Cloudflare Worker - TKGM API Proxy
 // Bu worker'ı Cloudflare Dashboard'da deploy edin
 
+// Batch endpoint sabitleri
+const MAX_BATCH_COORDS = 20;      // Maksimum koordinat sayisi
+const STAGGER_START_INDEX = 5;    // Bu indexten sonra gecikme baslar
+const STAGGER_DELAY_MS = 50;      // Her istek arasi gecikme (ms)
+
 export default {
   async fetch(request, env, ctx) {
     // CORS preflight
@@ -87,14 +92,14 @@ export default {
           });
         }
 
-        // Max 20 koordinat limiti (TKGM rate limit icin)
-        const limitedCoords = coordinates.slice(0, 20);
+        // Koordinat limitini uygula
+        const limitedCoords = coordinates.slice(0, MAX_BATCH_COORDS);
 
         const results = await Promise.all(
           limitedCoords.map(async (coord, index) => {
-            // Staggered delay: ilk 5 aninda, sonrakiler 50ms arayla
-            if (index >= 5) {
-              await new Promise(r => setTimeout(r, (index - 5) * 50));
+            // Staggered delay: ilk STAGGER_START_INDEX aninda, sonrakiler STAGGER_DELAY_MS arayla
+            if (index >= STAGGER_START_INDEX) {
+              await new Promise(r => setTimeout(r, (index - STAGGER_START_INDEX) * STAGGER_DELAY_MS));
             }
 
             const tkgmUrl = `https://cbsapi.tkgm.gov.tr/megsiswebapi.v3.1/api/parsel/${coord.lat}/${coord.lon}/`;

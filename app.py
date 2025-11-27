@@ -157,6 +157,8 @@ class TKGMClient:
 # ==================== WORKER THREAD ====================
 
 class ScanWorker(QThread):
+    BATCH_SIZE = 15  # Her batch'te kac nokta sorgulanacak
+
     progress = pyqtSignal(int, int)  # current, total
     log = pyqtSignal(str)
     parcel_found = pyqtSignal(str, dict)
@@ -172,8 +174,6 @@ class ScanWorker(QThread):
         self.is_running = True
 
     def run(self):
-        BATCH_SIZE = 15  # Her batch'te kac nokta sorgulanacak
-
         all_points = []
         for polygon in self.polygons:
             points = self.generate_grid_points(polygon)
@@ -181,7 +181,7 @@ class ScanWorker(QThread):
 
         total_points = len(all_points)
         remaining_points = list(all_points)  # Liste olarak tut (batch icin)
-        self.log.emit(f"Toplam {total_points} nokta taranacak (batch size: {BATCH_SIZE})")
+        self.log.emit(f"Toplam {total_points} nokta taranacak (batch size: {self.BATCH_SIZE})")
 
         found_count = 0
         found_ids = set()
@@ -190,8 +190,8 @@ class ScanWorker(QThread):
 
         while remaining_points and self.is_running:
             # Batch icin noktalari al
-            batch_points = remaining_points[:BATCH_SIZE]
-            remaining_points = remaining_points[BATCH_SIZE:]
+            batch_points = remaining_points[:self.BATCH_SIZE]
+            remaining_points = remaining_points[self.BATCH_SIZE:]
 
             api_calls += 1
             self.log.emit(f"Batch #{api_calls}: {len(batch_points)} nokta sorgulanıyor...")
@@ -226,25 +226,26 @@ class ScanWorker(QThread):
 
             # Batch sonrasi pruning: Bulunan parsellerin icine dusen noktalari ele
             if new_parcels_in_batch:
-                pruned_in_batch = 0
-                for result in new_parcels_in_batch:
-                    if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
-                        coords = result['geometry'].get('coordinates', [[]])[0]
-                        parcel_poly = [(c[1], c[0]) for c in coords]
+                # Tum yeni parsellerin poligonlarini topla
+                new_polygons = [
+                    [(c[1], c[0]) for c in result['geometry'].get('coordinates', [[]])[0]]
+                    for result in new_parcels_in_batch
+                    if 'geometry' in result and result['geometry'].get('type') == 'Polygon'
+                ]
 
-                        # Kalan noktalardan bu parselin icine dusenleri bul
-                        new_remaining = []
-                        for p in remaining_points:
-                            if not KMLParser.point_in_polygon(p[0], p[1], parcel_poly):
-                                new_remaining.append(p)
-                            else:
-                                pruned_in_batch += 1
+                if new_polygons:
+                    initial_count = len(remaining_points)
 
-                        remaining_points = new_remaining
+                    # Tek geciste tum poligonlara karsi kontrol et
+                    remaining_points = [
+                        p for p in remaining_points
+                        if not any(KMLParser.point_in_polygon(p[0], p[1], poly) for poly in new_polygons)
+                    ]
 
-                if pruned_in_batch > 0:
-                    total_pruned += pruned_in_batch
-                    self.log.emit(f"  ↳ {pruned_in_batch} nokta elendi (parseller icinde)")
+                    pruned_in_batch = initial_count - len(remaining_points)
+                    if pruned_in_batch > 0:
+                        total_pruned += pruned_in_batch
+                        self.log.emit(f"  ↳ {pruned_in_batch} nokta elendi (parseller icinde)")
 
             # Progress guncelle
             processed = total_points - len(remaining_points)
@@ -258,7 +259,7 @@ class ScanWorker(QThread):
 
         self.log.emit(f"\n{'='*50}")
         self.log.emit(f"SONUC: {found_count} parsel bulundu")
-        self.log.emit(f"API cagrilari: {api_calls} batch ({api_calls * BATCH_SIZE} yerine)")
+        self.log.emit(f"API cagrilari: {api_calls} batch ({api_calls * self.BATCH_SIZE} yerine)")
         self.log.emit(f"Elenen noktalar: {total_pruned}")
         self.log.emit(f"Tasarruf: ~{((total_points - api_calls) / total_points * 100):.1f}%")
         self.finished_scan.emit(found_count)

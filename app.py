@@ -202,6 +202,8 @@ class ScanWorker(QThread):
         found_ids = set()
         api_calls = 0
         total_pruned = 0
+        max_retries = 2  # Basarisiz batch'ler icin maksimum tekrar sayisi
+        retry_counts = {}  # batch_id -> retry count
 
         while remaining_points and self.is_running:
             # Batch icin noktalari al (deque'den O(1) popleft)
@@ -209,6 +211,7 @@ class ScanWorker(QThread):
                             for _ in range(min(self.BATCH_SIZE, len(remaining_points)))]
 
             api_calls += 1
+            batch_id = api_calls  # Bu batch'in kimlik numarasi
             self.log.emit(f"Batch #{api_calls}: {len(batch_points)} nokta sorgulanıyor...")
 
             results, error = self.client.get_batch(batch_points)
@@ -220,7 +223,17 @@ class ScanWorker(QThread):
                 break
 
             if error:
-                self.log.emit(f"  Batch hatasi: {error}")
+                # Retry mekanizmasi
+                current_retries = retry_counts.get(batch_id, 0)
+                if current_retries < max_retries:
+                    retry_counts[batch_id] = current_retries + 1
+                    self.log.emit(f"  Batch hatasi: {error}. Tekrar denenecek ({current_retries + 1}/{max_retries})")
+                    # Basarisiz noktalari tekrar kuyrugun basina ekle
+                    for p in reversed(batch_points):
+                        remaining_points.appendleft(p)
+                    time.sleep(self.delay * 2)  # Retry oncesi ekstra bekleme
+                    continue
+                self.log.emit(f"  Batch hatasi: {error}. Maksimum deneme asildi, atlanıyor.")
                 continue
 
             if not results:

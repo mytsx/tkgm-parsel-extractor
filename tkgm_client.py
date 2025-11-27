@@ -170,9 +170,11 @@ class TKGMClient:
             else:
                 # Worker ile batch
                 results = self.get_batch(coordinates)
-                for result in results:
+                for idx, result in enumerate(results):
                     if result and 'properties' in result:
-                        parsel_id = result['properties'].get('ozet', 'unknown')
+                        coord = coordinates[idx] if idx < len(coordinates) else {}
+                        fallback = f"{coord.get('lat', 'unknown')}_{coord.get('lon', '')}"
+                        parsel_id = result['properties'].get('ozet') or fallback
                         if parsel_id not in all_parcels:
                             all_parcels[parsel_id] = result
                             print(f"  Yeni parsel bulundu: {parsel_id}")

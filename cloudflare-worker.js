@@ -97,8 +97,8 @@ export default {
 
         const results = await Promise.all(
           limitedCoords.map(async (coord, index) => {
-            // Staggered delay: ilk STAGGER_START_INDEX aninda, sonrakiler STAGGER_DELAY_MS arayla
-            if (index >= STAGGER_START_INDEX) {
+            // Staggered delay: ilk 6 istek (0-5) aninda, sonrakiler STAGGER_DELAY_MS arayla
+            if (index > STAGGER_START_INDEX) {
               await new Promise(r => setTimeout(r, (index - STAGGER_START_INDEX) * STAGGER_DELAY_MS));
             }
 

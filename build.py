@@ -26,9 +26,9 @@ def build():
 
     # Hidden imports (gerekli olabilir)
     hidden_imports = [
-        "PySide6.QtCore",
-        "PySide6.QtGui",
-        "PySide6.QtWidgets",
+        "PyQt5.QtCore",
+        "PyQt5.QtGui",
+        "PyQt5.QtWidgets",
         "qfluentwidgets",
         "requests",
     ]

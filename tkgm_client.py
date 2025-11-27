@@ -9,12 +9,13 @@ Kullanım:
 3. Script'i çalıştırın
 """
 
-import requests
 import json
-import time
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
 import math
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import requests
 
 # Cloudflare Worker URL'inizi buraya yazın
 WORKER_URL = "https://your-worker.your-subdomain.workers.dev"
@@ -28,6 +29,8 @@ class BoundingBox:
     max_lon: float
 
 class TKGMClient:
+    """TKGM API istemcisi - Worker proxy veya direkt API uzerinden parsel sorgular."""
+
     def __init__(self, worker_url: str = None, use_direct: bool = False):
         """
         Args:
@@ -59,10 +62,9 @@ class TKGMClient:
 
             if response.status_code == 200:
                 return response.json()
-            else:
-                print(f"Hata: {response.status_code} - {lat}, {lon}")
-                return None
-        except Exception as e:
+            print(f"Hata: {response.status_code} - {lat}, {lon}")
+            return None
+        except requests.RequestException as e:
             print(f"İstek hatası: {e}")
             return None
 
@@ -88,10 +90,9 @@ class TKGMClient:
             if response.status_code == 200:
                 data = response.json()
                 return data.get('results', [])
-            else:
-                print(f"Batch hata: {response.status_code}")
-                return []
-        except Exception as e:
+            print(f"Batch hata: {response.status_code}")
+            return []
+        except requests.RequestException as e:
             print(f"Batch istek hatası: {e}")
             return []
 

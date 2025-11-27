@@ -9,6 +9,7 @@ import sys
 import platform
 
 def build():
+    """PyInstaller ile standalone uygulama olusturur."""
     system = platform.system()
 
     # PyInstaller komutu
@@ -44,7 +45,7 @@ def build():
     print(f"Building for {system}...")
     print(f"Command: {' '.join(cmd)}")
 
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, check=False)
 
     if result.returncode == 0:
         print("\n" + "="*50)

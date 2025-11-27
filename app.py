@@ -8,6 +8,7 @@ import sys
 import json
 import math
 import time
+from collections import deque
 from xml.etree import ElementTree as ET
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -191,7 +192,7 @@ class ScanWorker(QThread):
             all_points.extend(points)
 
         total_points = len(all_points)
-        remaining_points = list(all_points)  # Liste olarak tut (batch icin)
+        remaining_points = deque(all_points)  # deque: O(1) popleft performansi
         self.log.emit(f"Toplam {total_points} nokta taranacak (batch size: {self.BATCH_SIZE})")
 
         found_count = 0
@@ -200,9 +201,9 @@ class ScanWorker(QThread):
         total_pruned = 0
 
         while remaining_points and self.is_running:
-            # Batch icin noktalari al
-            batch_points = remaining_points[:self.BATCH_SIZE]
-            remaining_points = remaining_points[self.BATCH_SIZE:]
+            # Batch icin noktalari al (deque'den O(1) popleft)
+            batch_points = [remaining_points.popleft()
+                            for _ in range(min(self.BATCH_SIZE, len(remaining_points)))]
 
             api_calls += 1
             self.log.emit(f"Batch #{api_calls}: {len(batch_points)} nokta sorgulanıyor...")
@@ -226,7 +227,9 @@ class ScanWorker(QThread):
             new_parcels_in_batch = []
             for i, result in enumerate(results):
                 if result and 'properties' in result:
-                    parsel_id = result['properties'].get('ozet', f"unknown_{i}")
+                    # Koordinat bazli fallback ID (ozet yoksa)
+                    fallback_id = f"{batch_points[i][0]:.6f}_{batch_points[i][1]:.6f}"
+                    parsel_id = result['properties'].get('ozet') or fallback_id
                     if parsel_id not in found_ids:
                         found_ids.add(parsel_id)
                         found_count += 1
@@ -248,10 +251,10 @@ class ScanWorker(QThread):
                     initial_count = len(remaining_points)
 
                     # Tek geciste tum poligonlara karsi kontrol et
-                    remaining_points = [
+                    remaining_points = deque(
                         p for p in remaining_points
                         if not any(KMLParser.point_in_polygon(p[0], p[1], poly) for poly in new_polygons)
-                    ]
+                    )
 
                     pruned_in_batch = initial_count - len(remaining_points)
                     if pruned_in_batch > 0:

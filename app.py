@@ -170,7 +170,8 @@ class TKGMClient:
 class ScanWorker(QThread):
     """Arka planda alan taramasi yapan worker thread."""
 
-    BATCH_SIZE = 15  # Her batch'te kac nokta sorgulanacak
+    # Worker tarafinda MAX_BATCH_COORDS=20 limiti var, bu degerden kucuk tutulmali
+    BATCH_SIZE = 15
 
     progress = pyqtSignal(int, int)  # current, total
     log = pyqtSignal(str)

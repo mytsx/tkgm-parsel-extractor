@@ -6,9 +6,11 @@ PyQt5 + Fluent Design
 
 import sys
 import json
+import logging
 import math
 import time
 from collections import deque
+from pathlib import Path
 from xml.etree import ElementTree as ET
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -336,11 +338,29 @@ class MainWindow(QMainWindow):
         self.parcels = {}
         self.worker = None
 
+        # File logging setup
+        self.setup_logging()
+
         # Tema
         setTheme(Theme.LIGHT)
 
         self.setup_ui()
         self.load_settings()
+
+    def setup_logging(self):
+        """Log dosyasi olusturur."""
+        log_dir = Path.home() / ".tkgm_parsel"
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+        self.file_logger = logging.getLogger("tkgm_scan")
+        self.file_logger.setLevel(logging.DEBUG)
+
+        handler = logging.FileHandler(log_file, encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+        self.file_logger.addHandler(handler)
+
+        self.log_file_path = log_file
 
     def setup_ui(self):
         """Kullanici arayuzunu olusturur."""
@@ -490,9 +510,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("delay", self.delay_spin.value())
 
     def log(self, message: str):
-        """Log alanina zaman damgali mesaj ekler."""
+        """Log alanina zaman damgali mesaj ekler ve dosyaya yazar."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
+        # Dosyaya da yaz
+        self.file_logger.info(message)
 
     def select_kml(self):
         """KML dosyasi secme dialogunu acar."""
@@ -634,6 +656,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.status_label.setText(f"Tamamlandi - {count} parsel bulundu")
         self.log(f"Tarama tamamlandi! {count} benzersiz parsel bulundu")
+        self.log(f"Log dosyasi: {self.log_file_path}")
 
         InfoBar.success(
             title="Tamamlandi",

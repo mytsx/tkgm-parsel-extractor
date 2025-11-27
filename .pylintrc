@@ -7,7 +7,8 @@ extension-pkg-allow-list=PyQt5
 # E0611: PyQt5 icin false positive (no-name-in-module)
 # C0114: Module docstring (cok katı)
 # R0801: Duplicate code (BoundingBox gibi ortak yapilar icin)
-disable=E0611,C0114,R0801
+# R0913, R0917: Too many arguments (QuadTreeNode icin gerekli)
+disable=E0611,C0114,R0801,R0913,R0917
 
 [FORMAT]
 # Maksimum satir uzunlugu

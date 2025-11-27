@@ -712,10 +712,9 @@ class MainWindow(QMainWindow):
 <b>Durum:</b> {props.get('zeminKmdurum', '-')}
 ]]>"""
 
-            kml += f'<Placemark><name>{name}</name><description>{desc}</description>'
-            kml += '<styleUrl>#s</styleUrl>'
-            kml += f'<Polygon><outerBoundaryIs><LinearRing><coordinates>{coord_str}</coordinates>'
-            kml += '</LinearRing></outerBoundaryIs></Polygon></Placemark>\n'
+            kml += (f'<Placemark><name>{name}</name><description>{desc}</description><styleUrl>#s</styleUrl>'
+                    f'<Polygon><outerBoundaryIs><LinearRing><coordinates>{coord_str}</coordinates>'
+                    '</LinearRing></outerBoundaryIs></Polygon></Placemark>\n')
 
         kml += '</Document></kml>'
         with open(path, 'w', encoding='utf-8') as f:

@@ -289,10 +289,10 @@ class ScanWorker(QThread):
 
         self.log.emit(f"\n{'='*50}")
         self.log.emit(f"SONUC: {found_count} parsel bulundu")
-        self.log.emit(f"API cagrilari: {api_calls} batch ({total_points} nokta icin)")
-        self.log.emit(f"Elenen noktalar: {total_pruned}")
+        self.log.emit(f"API cagrilari: {api_calls} batch")
+        self.log.emit(f"Elenen noktalar: {total_pruned} (pruning ile)")
         savings = ((total_points - api_calls) / total_points * 100) if total_points > 0 else 0.0
-        self.log.emit(f"Tasarruf: ~{savings:.1f}%")
+        self.log.emit(f"HTTP Tasarrufu: ~{savings:.1f}% (tek tek sorguya kiyasla)")
         self.finished_scan.emit(found_count)
 
     def generate_grid_points(self, polygon):

@@ -172,8 +172,11 @@ class TKGMClient:
                 results = self.get_batch(coordinates)
                 for idx, result in enumerate(results):
                     if result and 'properties' in result:
-                        coord = coordinates[idx] if idx < len(coordinates) else {}
-                        fallback = f"{coord.get('lat', 'unknown')}_{coord.get('lon', '')}"
+                        if idx < len(coordinates):
+                            coord = coordinates[idx]
+                            fallback = f"{coord.get('lat', 'unknown')}_{coord.get('lon', 'unknown')}"
+                        else:
+                            fallback = f"unknown_index_{idx}"
                         parsel_id = result['properties'].get('ozet') or fallback
                         if parsel_id not in all_parcels:
                             all_parcels[parsel_id] = result

@@ -101,6 +101,9 @@ class KMLParser:
 class TKGMClient:
     """Cloudflare Worker uzerinden TKGM API istemcisi."""
 
+    REQUEST_TIMEOUT = 30       # Tekil istek timeout (saniye)
+    BATCH_REQUEST_TIMEOUT = 120  # Batch istek timeout (saniye)
+
     def __init__(self, worker_url: str, api_key: str = None):
         """Worker URL ve opsiyonel API key ile istemci olusturur."""
         self.worker_url = worker_url.rstrip('/')
@@ -117,7 +120,7 @@ class TKGMClient:
         """Returns (data, error_code) tuple"""
         try:
             url = f"{self.worker_url}/parsel/{lat}/{lon}"
-            response = self.session.get(url, timeout=30)
+            response = self.session.get(url, timeout=self.REQUEST_TIMEOUT)
             if response.status_code == 200:
                 data = response.json()
                 if 'properties' in data:
@@ -142,7 +145,7 @@ class TKGMClient:
             payload = {
                 "coordinates": [{"lat": c[0], "lon": c[1]} for c in coordinates]
             }
-            response = self.session.post(url, json=payload, timeout=120)
+            response = self.session.post(url, json=payload, timeout=self.BATCH_REQUEST_TIMEOUT)
 
             if response.status_code == 200:
                 data = response.json()
@@ -273,7 +276,7 @@ class ScanWorker(QThread):
 
         self.log.emit(f"\n{'='*50}")
         self.log.emit(f"SONUC: {found_count} parsel bulundu")
-        self.log.emit(f"API cagrilari: {api_calls} batch ({api_calls * self.BATCH_SIZE} yerine)")
+        self.log.emit(f"API cagrilari: {api_calls} batch ({total_points} nokta icin)")
         self.log.emit(f"Elenen noktalar: {total_pruned}")
         savings = ((total_points - api_calls) / total_points * 100) if total_points > 0 else 0.0
         self.log.emit(f"Tasarruf: ~{savings:.1f}%")

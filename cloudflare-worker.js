@@ -122,6 +122,7 @@ export default {
               // Bos/hata durumunda null dondur
               return null;
             } catch (e) {
+              console.error(`Batch request failed for coord: ${JSON.stringify(coord)}`, e.message);
               return null;
             }
           })

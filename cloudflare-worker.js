@@ -1,6 +1,11 @@
 // Cloudflare Worker - TKGM API Proxy
 // Bu worker'ı Cloudflare Dashboard'da deploy edin
 
+// Batch endpoint sabitleri
+const MAX_BATCH_COORDS = 20;      // Maksimum koordinat sayisi
+const STAGGER_START_INDEX = 5;    // Bu indexten sonra gecikme baslar
+const STAGGER_DELAY_MS = 50;      // Her istek arasi gecikme (ms)
+
 export default {
   async fetch(request, env, ctx) {
     // CORS preflight
@@ -74,7 +79,7 @@ export default {
       }
     }
 
-    // /batch endpoint'i - toplu sorgu
+    // /batch endpoint'i - toplu sorgu (optimize edilmis)
     if (url.pathname === "/batch" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -87,10 +92,15 @@ export default {
           });
         }
 
+        // Koordinat limitini uygula
+        const limitedCoords = coordinates.slice(0, MAX_BATCH_COORDS);
+
         const results = await Promise.all(
-          coordinates.map(async (coord, index) => {
-            // Küçük delay ekle (rate limit için)
-            await new Promise(r => setTimeout(r, index * 100));
+          limitedCoords.map(async (coord, index) => {
+            // Staggered delay: ilk 6 istek (0-5) aninda, sonrakiler STAGGER_DELAY_MS arayla
+            if (index > STAGGER_START_INDEX) {
+              await new Promise(r => setTimeout(r, (index - STAGGER_START_INDEX) * STAGGER_DELAY_MS));
+            }
 
             const tkgmUrl = `https://cbsapi.tkgm.gov.tr/megsiswebapi.v3.1/api/parsel/${coord.lat}/${coord.lon}/`;
 
@@ -105,16 +115,27 @@ export default {
               });
 
               if (response.ok) {
-                return await response.json();
+                const data = await response.json();
+                // Basarili sonucu dondur
+                return data;
               }
-              return { error: `HTTP ${response.status}`, coord };
+              // Bos/hata durumunda null dondur
+              return null;
             } catch (e) {
-              return { error: e.message, coord };
+              console.error(`Batch request failed for coord: ${JSON.stringify(coord)}`, e.message);
+              return null;
             }
           })
         );
 
-        return new Response(JSON.stringify({ results, count: results.length }), {
+        // Basarili sonuclari say
+        const successCount = results.filter(r => r && r.properties).length;
+
+        return new Response(JSON.stringify({
+          results,
+          count: results.length,
+          success: successCount
+        }), {
           headers: {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*"

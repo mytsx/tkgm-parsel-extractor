@@ -1,0 +1,21 @@
+[MASTER]
+# PyQt5 modulleri icin extension-pkg-allow-list
+extension-pkg-allow-list=PyQt5
+
+[MESSAGES CONTROL]
+# Devre disi birakilan kontroller:
+# E0611: PyQt5 icin false positive (no-name-in-module)
+# C0114: Module docstring (cok katı)
+# R0801: Duplicate code (BoundingBox gibi ortak yapilar icin)
+disable=E0611,C0114,R0801
+
+[FORMAT]
+# Maksimum satir uzunlugu
+max-line-length=120
+
+[DESIGN]
+# Fonksiyon/method limitleri
+max-locals=30
+max-statements=100
+max-attributes=20
+max-branches=15

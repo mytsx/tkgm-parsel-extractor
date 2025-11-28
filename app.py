@@ -459,12 +459,10 @@ class ScanWorker(QThread):
                 if not parcel_poly or len(parcel_poly) < 3:
                     continue
 
-                # Parsel hash'i (koordinat bazli - cakisma riski yok)
-                # Koordinatlari sirala (baslangic noktasindan bagimsiz hash)
-                sorted_coords = sorted(parcel_poly)
-                # Performans icin sadece ilk 5 + son 5 koordinat + toplam sayi
-                sample_coords = sorted_coords[:5] + sorted_coords[-5:] if len(sorted_coords) > 10 else sorted_coords
-                poly_hash = f"{len(parcel_poly)}:" + ";".join(f"{c[0]:.5f},{c[1]:.5f}" for c in sample_coords)
+                # Parsel hash'i (koordinat bazli - tuple hash ile)
+                # Siralama baslangic noktasindan bagimsizlik saglar
+                # round() kayan nokta hassasiyet farklarini onler
+                poly_hash = tuple(sorted((round(lat, 5), round(lon, 5)) for lat, lon in parcel_poly))
                 if poly_hash in walked_parcels:
                     continue
                 walked_parcels.add(poly_hash)

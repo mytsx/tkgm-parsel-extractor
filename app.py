@@ -249,6 +249,7 @@ class ScanWorker(QThread):
     GAP_FILL_STEP_DIVISOR = 2  # step_meters / bu deger = gap fill adimi
 
     progress = pyqtSignal(int, int)  # current, total
+    stats_update = pyqtSignal(dict)  # Detayli istatistikler
     log = pyqtSignal(str)
     parcel_found = pyqtSignal(str, dict)
     finished_scan = pyqtSignal(int)
@@ -271,6 +272,21 @@ class ScanWorker(QThread):
         self.cells_skipped = 0
         self.boundary_walks = 0
         self.gap_fill_points = 0
+        self.total_points_queried = 0
+        self.points_remaining = 0
+        self.current_phase = ""
+        self.null_responses = 0  # API'den null/bos donen sorgular
+
+    def _emit_stats(self):
+        """Guncel istatistikleri UI'a gonderir."""
+        self.stats_update.emit({
+            "phase": self.current_phase,
+            "found": len(self.found_ids),
+            "api_calls": self.api_calls,
+            "queried": self.total_points_queried,
+            "remaining": self.points_remaining,
+            "null_responses": self.null_responses
+        })
 
     def run(self):
         """Hibrit Quadtree + Grid + Boundary Walking + Gap Fill tarama algoritmasi."""
@@ -320,6 +336,7 @@ class ScanWorker(QThread):
 
     def _phase1_quadtree_scan(self, polygon: List[Tuple[float, float]]) -> int:
         """FAZ 1: Quadtree + Grid hibrit tarama."""
+        self.current_phase = "Quadtree"
         found_count = 0
 
         # Polygon icin quadtree olustur
@@ -355,12 +372,18 @@ class ScanWorker(QThread):
                     cells_to_process.append(child)
                 estimated_total += 3  # 1 hucre -> 4 hucre, net +3
 
+            # Her 5 hucrede bir stats guncelle
+            if self.cells_processed % 5 == 0:
+                self.points_remaining = len(cells_to_process)
+                self._emit_stats()
+
             time.sleep(self.delay)
 
         return found_count
 
     def _phase2_boundary_walk(self, polygon: List[Tuple[float, float]]) -> int:
         """FAZ 2: Sinir takibi - bulunan parsellerin kenarlarindan disa yuruyerek komsulari bul."""
+        self.current_phase = "Boundary"
         found_count = 0
 
         if not self.found_parcels:
@@ -430,6 +453,7 @@ class ScanWorker(QThread):
 
     def _phase3_gap_fill(self, polygon: List[Tuple[float, float]]) -> int:
         """FAZ 3: Kalan bosluklari daha yogun grid ile tara."""
+        self.current_phase = "Gap Fill"
         found_count = 0
 
         # Daha yogun grid adimi
@@ -482,6 +506,8 @@ class ScanWorker(QThread):
 
             if batch_num % 10 == 0:
                 self.log.emit(f"  Batch {batch_num}/{total_batches} - {found_count} yeni parsel")
+                self.points_remaining = len(remaining)
+                self._emit_stats()
 
             time.sleep(self.delay)
 
@@ -734,6 +760,7 @@ class ScanWorker(QThread):
     def _query_batch(self, points: List[Tuple[float, float]]) -> Tuple[list, any]:
         """Batch sorgu yapar ve hatalari yonetir."""
         self.api_calls += 1
+        self.total_points_queried += len(points)
         max_retries = 2
 
         for attempt in range(max_retries + 1):
@@ -743,12 +770,19 @@ class ScanWorker(QThread):
                 return None, 401
 
             if not error:
+                # Null/bos sonuclari say
+                if results:
+                    for r in results:
+                        if r is None or (isinstance(r, dict) and 'properties' not in r):
+                            self.null_responses += 1
                 return results, None
 
             if attempt < max_retries:
                 self.log.emit(f"  Batch hatasi, tekrar deneniyor ({attempt + 1}/{max_retries})...")
                 time.sleep(self.delay * 2)
 
+        # Tum batch bos dondu
+        self.null_responses += len(points)
         return None, error
 
     def _log_summary(self, found_count: int):
@@ -757,7 +791,8 @@ class ScanWorker(QThread):
         self.log.emit("TARAMA OZETI")
         self.log.emit("="*50)
         self.log.emit(f"Toplam parsel: {found_count}")
-        self.log.emit(f"API cagrilari: {self.api_calls} batch")
+        self.log.emit(f"API cagrilari: {self.api_calls} batch ({self.total_points_queried} nokta)")
+        self.log.emit(f"Bos/null yanit: {self.null_responses} nokta")
         self.log.emit(f"Quadtree hucreleri: {self.cells_processed} islendi, {self.cells_skipped} atlandi")
         self.log.emit(f"Sinir takibi: {self.boundary_walks} parsel siniri tarandi")
         self.log.emit(f"Bosluk doldurma: {self.gap_fill_points} nokta tarandi")
@@ -904,6 +939,13 @@ class MainWindow(QMainWindow):
         self.save_btn.clicked.connect(self.save_results)
         btn_layout.addWidget(self.save_btn)
 
+        self.refine_btn = PushButton("Detaylandir")
+        self.refine_btn.setIcon(FluentIcon.SYNC)
+        self.refine_btn.clicked.connect(self.refine_scan)
+        self.refine_btn.setEnabled(False)
+        self.refine_btn.setToolTip("Eksik bolgeler icin daha yogun grid ile tekrar tara")
+        btn_layout.addWidget(self.refine_btn)
+
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
@@ -918,6 +960,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         progress_layout.addWidget(self.progress_bar)
+
+        # Detayli istatistik satiri
+        self.stats_label = BodyLabel("")
+        self.stats_label.setStyleSheet("color: #666; font-size: 11px;")
+        progress_layout.addWidget(self.stats_label)
 
         layout.addWidget(progress_card)
 
@@ -1059,11 +1106,13 @@ class MainWindow(QMainWindow):
             self.delay_spin.value()
         )
         self.worker.progress.connect(self.on_progress)
+        self.worker.stats_update.connect(self.on_stats_update)
         self.worker.log.connect(self.log)
         self.worker.parcel_found.connect(self.on_parcel_found)
         self.worker.finished_scan.connect(self.on_finished)
         self.worker.auth_error.connect(self.on_auth_error)
         self.worker.start()
+        self.refine_btn.setEnabled(False)
 
         self.log("Tarama baslatildi...")
 
@@ -1077,7 +1126,17 @@ class MainWindow(QMainWindow):
         """Ilerleme sinyalini isler."""
         percent = int(current / total * 100) if total > 0 else 0
         self.progress_bar.setValue(percent)
-        self.status_label.setText(f"Taraniyor: {current}/{total} | Bulunan: {len(self.parcels)} parsel")
+        self.status_label.setText(f"Taraniyor: %{percent} | Bulunan: {len(self.parcels)} parsel")
+
+    def on_stats_update(self, stats: dict):
+        """Detayli istatistik sinyalini isler."""
+        phase = stats.get("phase", "")
+        queried = stats.get("queried", 0)
+        remaining = stats.get("remaining", 0)
+        null_resp = stats.get("null_responses", 0)
+        self.stats_label.setText(
+            f"Faz: {phase} | Sorgulanan: {queried} | Kalan: {remaining} | Bos yanit: {null_resp}"
+        )
 
     def on_parcel_found(self, parsel_id: str, data: dict):
         """Bulunan parseli kaydeder."""
@@ -1101,17 +1160,73 @@ class MainWindow(QMainWindow):
         """Tarama tamamlandiginda cagrilir."""
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.refine_btn.setEnabled(True)  # Detaylandir butonunu aktif et
         self.status_label.setText(f"Tamamlandi - {count} parsel bulundu")
         self.log(f"Tarama tamamlandi! {count} benzersiz parsel bulundu")
         self.log(f"Log dosyasi: {self.log_file_path}")
 
         InfoBar.success(
             title="Tamamlandi",
-            content=f"{count} parsel bulundu",
+            content=f"{count} parsel bulundu. Eksik bolge varsa 'Detaylandir' butonuna basin.",
             parent=self,
             position=InfoBarPosition.TOP_RIGHT,
             duration=5000
         )
+
+    def refine_scan(self):
+        """Eksik bolgeleri daha yogun grid ile tekrar tarar."""
+        if not self.polygons:
+            InfoBar.warning(
+                title="Uyari",
+                content="Taranacak polygon yok",
+                parent=self,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=3000
+            )
+            return
+
+        url = self.worker_url_input.text().strip()
+        if not url:
+            return
+
+        # Daha yogun grid (mevcut step'in 1/3'u, min 5m)
+        refined_step = max(5, self.step_spin.value() // 3)
+
+        self.log("\n=== DETAYLANDIRMA TARAMASI ===")
+        self.log(f"Yogun grid adimi: {refined_step}m (onceki: {self.step_spin.value()}m)")
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.refine_btn.setEnabled(False)
+
+        api_key = self.api_key_input.text().strip() or None
+        client = TKGMClient(url, api_key)
+
+        # Yeni worker olustur - mevcut bulunan parselleri aktar
+        self.worker = ScanWorker(
+            client,
+            self.polygons,
+            refined_step,
+            self.delay_spin.value()
+        )
+
+        # Onceki taramadan bulunan parselleri aktar (pruning icin)
+        for parsel_id, data in self.parcels.items():
+            self.worker.found_ids.add(parsel_id)
+            if 'geometry' in data and data['geometry'].get('type') == 'Polygon':
+                coords = data['geometry'].get('coordinates', [[]])[0]
+                parcel_poly = [(c[1], c[0]) for c in coords]
+                self.worker.found_parcels.append(parcel_poly)
+
+        self.worker.progress.connect(self.on_progress)
+        self.worker.stats_update.connect(self.on_stats_update)
+        self.worker.log.connect(self.log)
+        self.worker.parcel_found.connect(self.on_parcel_found)
+        self.worker.finished_scan.connect(self.on_finished)
+        self.worker.auth_error.connect(self.on_auth_error)
+        self.worker.start()
+
+        self.log(f"Detaylandirma baslatildi ({len(self.parcels)} mevcut parsel korunuyor)...")
 
     def save_results(self):
         """Sonuclari dosyaya kaydetme dialogunu acar."""
@@ -1127,7 +1242,7 @@ class MainWindow(QMainWindow):
 
         path, _ = QFileDialog.getSaveFileName(
             self, "Kaydet", "",
-            "GeoJSON (*.geojson);;KML (*.kml);;JSON (*.json)"
+            "KML (*.kml);;GeoJSON (*.geojson);;JSON (*.json)"
         )
 
         if not path:

@@ -432,7 +432,11 @@ class ScanWorker(QThread):
                 if not self.is_running:
                     break
 
-                # Parsel hash'i (centroid + alan - en guvenilir)
+                # Bos veya gecersiz poligonu atla
+                if not parcel_poly or len(parcel_poly) < 3:
+                    continue
+
+                # Parsel hash'i (centroid + nokta sayisi)
                 # Centroid hesapla
                 lats = [c[0] for c in parcel_poly]
                 lons = [c[1] for c in parcel_poly]
@@ -623,10 +627,11 @@ class ScanWorker(QThread):
                         props = result['properties']
                         self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
 
-                        # Geometriyi kaydet (pruning icin)
+                        # Geometriyi kaydet (pruning icin) - en az 3 nokta olmali
                         if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
                             coords = result['geometry'].get('coordinates', [[]])[0]
-                            self.found_parcels.append(self.geojson_coords_to_poly(coords))
+                            if len(coords) >= 3:
+                                self.found_parcels.append(self.geojson_coords_to_poly(coords))
 
             time.sleep(self.delay)
 
@@ -700,10 +705,11 @@ class ScanWorker(QThread):
                     props = result['properties']
                     self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
 
-                    # Geometriyi kaydet (pruning icin)
+                    # Geometriyi kaydet (pruning icin) - en az 3 nokta olmali
                     if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
                         coords = result['geometry'].get('coordinates', [[]])[0]
-                        self.found_parcels.append(self.geojson_coords_to_poly(coords))
+                        if len(coords) >= 3:
+                            self.found_parcels.append(self.geojson_coords_to_poly(coords))
 
                 unique_parcels.add(parsel_id)
 
@@ -751,9 +757,11 @@ class ScanWorker(QThread):
                         props = result['properties']
                         self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
 
+                        # En az 3 nokta olmali
                         if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
                             coords = result['geometry'].get('coordinates', [[]])[0]
-                            self.found_parcels.append(self.geojson_coords_to_poly(coords))
+                            if len(coords) >= 3:
+                                self.found_parcels.append(self.geojson_coords_to_poly(coords))
 
             time.sleep(self.delay)
 
@@ -1147,7 +1155,8 @@ class MainWindow(QMainWindow):
                 self.worker.found_ids.add(parsel_id)
                 if 'geometry' in data and data['geometry'].get('type') == 'Polygon':
                     coords = data['geometry'].get('coordinates', [[]])[0]
-                    self.worker.found_parcels.append(ScanWorker.geojson_coords_to_poly(coords))
+                    if len(coords) >= 3:  # En az 3 nokta olmali
+                        self.worker.found_parcels.append(ScanWorker.geojson_coords_to_poly(coords))
 
         # Sinyalleri bagla
         self.worker.progress.connect(self.on_progress)

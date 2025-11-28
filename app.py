@@ -567,22 +567,26 @@ class ScanWorker(QThread):
                 mid_lat = p1[0] + t * (p2[0] - p1[0])
                 mid_lon = p1[1] + t * (p2[1] - p1[1])
 
-                # Normal vektor (kenardan disa dogru)
-                # Kenar vektoru: (lat_diff, lon_diff)
-                # Normal vektor: 90 derece saat yonunde dondurmek icin (-lon, lat)
-                # Bu sayede nx enlem yonunde, ny boylam yonunde disa dogru adim saglar
+                # Kenardan disa dogru normal vektor hesaplama
+                # Kenar vektoru (metre): (lon_diff, lat_diff)
+                # 90 derece saat yonunde dondurulmus normal: (lat_diff, -lon_diff)
                 if edge_length > 0:
-                    nx = -lon_diff / edge_length  # Enlem yonundeki birim normal
-                    ny = lat_diff / edge_length   # Boylam yonundeki birim normal
+                    # Birim normal vektor bilesenleri
+                    normal_x_unit = lat_diff / edge_length   # lon yonunde
+                    normal_y_unit = -lon_diff / edge_length  # lat yonunde
 
-                    # Disa dogru adim (her iki yon)
-                    outward_lat = self.OUTWARD_STEP_METERS / 111000
-                    outward_lon = self.OUTWARD_STEP_METERS / (111000 * math.cos(math.radians(mid_lat)))
-
-                    # Iki tarafta da nokta olustur
+                    # Kenarin her iki tarafinda da nokta olustur (ic/dis yon garantisi)
                     for direction in [1, -1]:
-                        new_lat = mid_lat + direction * nx * outward_lat
-                        new_lon = mid_lon + direction * ny * outward_lon
+                        # Adim vektoru (metre)
+                        delta_lat_m = direction * self.OUTWARD_STEP_METERS * normal_y_unit
+                        delta_lon_m = direction * self.OUTWARD_STEP_METERS * normal_x_unit
+
+                        # Metre -> derece donusumu
+                        delta_lat_deg = delta_lat_m / 111000
+                        delta_lon_deg = delta_lon_m / (111000 * math.cos(math.radians(mid_lat)))
+
+                        new_lat = mid_lat + delta_lat_deg
+                        new_lon = mid_lon + delta_lon_deg
 
                         # Sadece arama polygon'u icindeki noktalari ekle
                         if KMLParser.point_in_polygon(new_lat, new_lon, search_polygon):

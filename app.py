@@ -459,13 +459,12 @@ class ScanWorker(QThread):
                 if not parcel_poly or len(parcel_poly) < 3:
                     continue
 
-                # Parsel hash'i (centroid + nokta sayisi)
-                # Centroid hesapla
-                lats = [c[0] for c in parcel_poly]
-                lons = [c[1] for c in parcel_poly]
-                centroid_lat = sum(lats) / len(lats)
-                centroid_lon = sum(lons) / len(lons)
-                poly_hash = f"{centroid_lat:.5f}_{centroid_lon:.5f}_{len(parcel_poly)}"
+                # Parsel hash'i (koordinat bazli - cakisma riski yok)
+                # Koordinatlari sirala (baslangic noktasindan bagimsiz hash)
+                sorted_coords = sorted(parcel_poly)
+                # Performans icin sadece ilk 5 + son 5 koordinat + toplam sayi
+                sample_coords = sorted_coords[:5] + sorted_coords[-5:] if len(sorted_coords) > 10 else sorted_coords
+                poly_hash = f"{len(parcel_poly)}:" + ";".join(f"{c[0]:.5f},{c[1]:.5f}" for c in sample_coords)
                 if poly_hash in walked_parcels:
                     continue
                 walked_parcels.add(poly_hash)

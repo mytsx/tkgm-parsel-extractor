@@ -623,8 +623,10 @@ class ScanWorker(QThread):
                         new_lat = mid_lat + delta_lat_deg
                         new_lon = mid_lon + delta_lon_deg
 
-                        # Sadece arama polygon'u icindeki noktalari ekle
-                        if KMLParser.point_in_polygon(new_lat, new_lon, search_polygon):
+                        # Arama polygon'u icinde VE mevcut parselin disinda olmali
+                        # (parselin icine dusen noktalar zaten pruning'de elenecekti)
+                        if (KMLParser.point_in_polygon(new_lat, new_lon, search_polygon) and
+                                not KMLParser.point_in_polygon(new_lat, new_lon, parcel_poly)):
                             edge_points.append((new_lat, new_lon))
 
         return edge_points

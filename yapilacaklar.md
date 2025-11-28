@@ -1,9 +1,19 @@
--- çıktı formatı default kml olsun
+# Yapilacaklar
 
--- bekleme süresini biz girmemeliyiz detay ayarlar ekranında vs olabilir oradan ayarlarız çünkü o ince ayar sonuçta
+## UI Iyilestirmeleri
+- [x] Cikti formati varsayilan olarak KML olsun
+- [ ] Bekleme suresi ayari "Gelismis Ayarlar" menusune tasinmali
 
--- işlem kısmında kaç noktanın sorgulandığı kaç noktanın kaldığını vs göstermeli arada artıyor vs ya o durumdada güncellemeli 
+## Tarama Ozellikleri
+- [x] Tarama sirasinda sorgulanan/kalan nokta sayisi gibi detayli istatistikler gosterilmeli
+- [x] Kullanicinin eksik bolgeleri daha yogun grid ile tekrar tarayabilmesi icin "Detaylandir" ozelligi
 
--- kulanıcı eksik yerler olduğunu düşündüğünde detaylandır dediğinde halen boş alanlar varsa oraları daha detaylı grid ile tekrar çekmeye çalışmalı
+## Gelecek Ozellikler (Lokal Veritabani)
+- [ ] Indirilen parsel verileri lokal bir veritabaninda (PostGIS + PostgreSQL) saklanmali
+  - [ ] Docker Compose ile PostgreSQL kurulumu
+  - [ ] Veri guncellik tarihi alani eklenmeli
+  - [ ] "Onbellekten kullan" veya "Verileri guncelle" secenekleri
+  - [ ] KML/GeoJSON export'a cekilme tarihi bilgisi eklenmeli
 
--- daha önceden indirilen alanlar varsa onları local bir db'te tutmalı varsa orada alan oradan çekmeli. bunun sonrasında local değilde tamamen güncel çek gibi veya çektikten sonra local'den gelenleri güncel çek gibi özellikler eklenebilir. local'deki veriler için kml'ye çeklilme tarihi bilgisi eklenmeli (sadece kml değil tabi diğer veri formatları içinde geçerli). local db için geoloc verileri en iyi sanırım postgre'de tutabiliyoruz o yüzden onun kullanalım docker'da ayarlayabiliriz sanırım.
+## Kod Kalitesi (Gelecek Refactoring)
+- [ ] ScanWorker sinifini ayir: QuadtreeScanner, BoundaryWalker, GapFiller

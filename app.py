@@ -299,6 +299,29 @@ class ScanWorker(QThread):
         """GeoJSON koordinatlarini (lon, lat) -> (lat, lon) tuple listesine donusturur."""
         return [(c[1], c[0]) for c in coords]
 
+    def _process_found_parcel(self, result: dict, point: Tuple[float, float]) -> Tuple[str, bool]:
+        """
+        Parsel sonucunu isler. Bulunduysa ID'sini ve yeni olup olmadigini dondurur.
+        Returns: (parsel_id, is_new)
+        """
+        parsel_id = self.get_parcel_id(result, point)
+        is_new = False
+
+        if parsel_id not in self.found_ids:
+            is_new = True
+            self.found_ids.add(parsel_id)
+            self.parcel_found.emit(parsel_id, result)
+            props = result['properties']
+            self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
+
+            # Geometriyi kaydet (pruning icin) - en az 3 nokta olmali
+            if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
+                coords = result['geometry'].get('coordinates', [[]])[0]
+                if len(coords) >= 3:
+                    self.found_parcels.append(self.geojson_coords_to_poly(coords))
+
+        return parsel_id, is_new
+
     def _emit_stats(self):
         """Guncel istatistikleri UI'a gonderir."""
         self.stats_update.emit({
@@ -459,15 +482,20 @@ class ScanWorker(QThread):
                 if not edge_points:
                     continue
 
-                # Batch sorgu
+                # Batch sorgu - onceki/sonraki polygon sayisini karsilastir
+                polys_before = len(self.found_parcels)
                 new_parcels = self._query_and_process_points(edge_points)
+                polys_after = len(self.found_parcels)
+
                 found_count += new_parcels
                 new_in_iteration += new_parcels
                 self.boundary_walks += 1
 
-                # Yeni bulunan parselleri kuyruga ekle
-                for poly in self.found_parcels[-new_parcels:] if new_parcels > 0 else []:
-                    parcels_to_walk.append(poly)
+                # Yeni eklenen polygonlari kuyruga ekle (geometrisi olan parseller)
+                num_new_polys = polys_after - polys_before
+                if num_new_polys > 0:
+                    for poly in self.found_parcels[-num_new_polys:]:
+                        parcels_to_walk.append(poly)
 
                 time.sleep(self.delay)
 
@@ -618,20 +646,9 @@ class ScanWorker(QThread):
 
             for i, result in enumerate(results):
                 if result and 'properties' in result:
-                    parsel_id = self.get_parcel_id(result, batch[i])
-
-                    if parsel_id not in self.found_ids:
-                        self.found_ids.add(parsel_id)
+                    _, is_new = self._process_found_parcel(result, batch[i])
+                    if is_new:
                         new_count += 1
-                        self.parcel_found.emit(parsel_id, result)
-                        props = result['properties']
-                        self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
-
-                        # Geometriyi kaydet (pruning icin) - en az 3 nokta olmali
-                        if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
-                            coords = result['geometry'].get('coordinates', [[]])[0]
-                            if len(coords) >= 3:
-                                self.found_parcels.append(self.geojson_coords_to_poly(coords))
 
             time.sleep(self.delay)
 
@@ -696,21 +713,9 @@ class ScanWorker(QThread):
 
         for i, result in enumerate(results):
             if result and 'properties' in result:
-                parsel_id = self.get_parcel_id(result, valid_points[i])
-
-                if parsel_id not in self.found_ids:
-                    self.found_ids.add(parsel_id)
+                parsel_id, is_new = self._process_found_parcel(result, valid_points[i])
+                if is_new:
                     new_count += 1
-                    self.parcel_found.emit(parsel_id, result)
-                    props = result['properties']
-                    self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
-
-                    # Geometriyi kaydet (pruning icin) - en az 3 nokta olmali
-                    if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
-                        coords = result['geometry'].get('coordinates', [[]])[0]
-                        if len(coords) >= 3:
-                            self.found_parcels.append(self.geojson_coords_to_poly(coords))
-
                 unique_parcels.add(parsel_id)
 
         # Karar ver: subdivide etmeli mi?
@@ -748,20 +753,9 @@ class ScanWorker(QThread):
 
             for i, result in enumerate(results):
                 if result and 'properties' in result:
-                    parsel_id = self.get_parcel_id(result, batch[i])
-
-                    if parsel_id not in self.found_ids:
-                        self.found_ids.add(parsel_id)
+                    _, is_new = self._process_found_parcel(result, batch[i])
+                    if is_new:
                         new_count += 1
-                        self.parcel_found.emit(parsel_id, result)
-                        props = result['properties']
-                        self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
-
-                        # En az 3 nokta olmali
-                        if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
-                            coords = result['geometry'].get('coordinates', [[]])[0]
-                            if len(coords) >= 3:
-                                self.found_parcels.append(self.geojson_coords_to_poly(coords))
 
             time.sleep(self.delay)
 

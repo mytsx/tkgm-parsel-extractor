@@ -142,7 +142,7 @@ class TKGMClient:
         Returns:
             (results_list, meta_dict, error_code) tuple
             results_list: [{data}, {data}, ...] veya None'lar
-            meta_dict: {"count": N, "success": M, "failed": K}
+            meta_dict: {"found": N, "empty": M, "error": K, "error_coords": [...]}
         """
         try:
             url = f"{self.worker_url}/batch"
@@ -154,25 +154,49 @@ class TKGMClient:
             if response.status_code == 200:
                 data = response.json()
                 results = data.get('results', [])
-                count = data.get('count', len(results))
-                success = data.get('success', 0)
+                stats = data.get('stats', {})
 
-                # Her sonucu kontrol et, gecerli parsel mi?
+                # Yeni format kontrolu
+                is_new_format = results and isinstance(results[0], dict) and 'status' in results[0]
+
                 processed = []
-                actual_success = 0
-                for r in results:
-                    if r and isinstance(r, dict) and 'properties' in r:
-                        processed.append(r)
-                        actual_success += 1
-                    else:
-                        processed.append(None)
+                error_coords = []  # Hata alan koordinatlar (retry icin)
 
-                meta = {
-                    "count": count,
-                    "success": actual_success,
-                    "empty": count - actual_success,
-                    "worker_success": success  # Worker'ın raporladığı
-                }
+                if is_new_format:
+                    # Yeni format: {"status": "found/empty/error", "data": {...}, "coord": {...}}
+                    for r in results:
+                        status = r.get('status')
+                        if status == 'found':
+                            processed.append(r.get('data'))
+                        elif status == 'error':
+                            processed.append(None)
+                            coord = r.get('coord', {})
+                            error_coords.append((coord.get('lat'), coord.get('lon')))
+                        else:  # empty
+                            processed.append(None)
+
+                    meta = {
+                        "found": stats.get('found', 0),
+                        "empty": stats.get('empty', 0),
+                        "error": stats.get('error', 0),
+                        "error_coords": error_coords
+                    }
+                else:
+                    # Eski format (geriye uyumluluk)
+                    for r in results:
+                        if r and isinstance(r, dict) and 'properties' in r:
+                            processed.append(r)
+                        else:
+                            processed.append(None)
+
+                    found = len([p for p in processed if p])
+                    meta = {
+                        "found": found,
+                        "empty": len(processed) - found,
+                        "error": 0,
+                        "error_coords": []
+                    }
+
                 return processed, meta, None
 
             if response.status_code == 401:
@@ -453,7 +477,7 @@ class ScanWorker(QThread):
                     processed += 1
 
                     try:
-                        results, _meta, error = future.result()
+                        results, meta, error = future.result()
 
                         if error == 401:
                             self.auth_error.emit()
@@ -472,6 +496,12 @@ class ScanWorker(QThread):
                         if error:
                             self.failed_points += len(batch)
                             continue
+
+                        # Worker'dan gelen hata koordinatlarini retry'a ekle
+                        error_coords = meta.get('error_coords', []) if meta else []
+                        if error_coords and retry_count < 2:
+                            retry_queue.append((error_coords, retry_count + 1))
+                            self.log.emit(f"  ⚠ {len(error_coords)} koordinat hatali, retry'a eklendi")
 
                         # Sonuclari isle
                         for i, result in enumerate(results):

@@ -114,27 +114,57 @@ export default {
                 }
               });
 
+              // Detayli status bilgisi
               if (response.ok) {
                 const data = await response.json();
-                // Basarili sonucu dondur
-                return data;
+                if (data && data.properties) {
+                  return {
+                    status: "found",
+                    data: data,
+                    coord: coord
+                  };
+                }
+                // API 200 dondurdu ama parsel yok
+                return {
+                  status: "empty",
+                  data: null,
+                  coord: coord
+                };
               }
-              // Bos/hata durumunda null dondur
-              return null;
+
+              // HTTP hata kodlari
+              return {
+                status: "error",
+                error: response.status,
+                data: null,
+                coord: coord
+              };
             } catch (e) {
               console.error(`Batch request failed for coord: ${JSON.stringify(coord)}`, e.message);
-              return null;
+              return {
+                status: "error",
+                error: e.message,
+                data: null,
+                coord: coord
+              };
             }
           })
         );
 
-        // Basarili sonuclari say
-        const successCount = results.filter(r => r && r.properties).length;
+        // Istatistikler
+        const stats = {
+          total: results.length,
+          found: results.filter(r => r.status === "found").length,
+          empty: results.filter(r => r.status === "empty").length,
+          error: results.filter(r => r.status === "error").length
+        };
 
         return new Response(JSON.stringify({
           results,
+          stats,
+          // Geriye uyumluluk icin eski format
           count: results.length,
-          success: successCount
+          success: stats.found
         }), {
           headers: {
             "Content-Type": "application/json",

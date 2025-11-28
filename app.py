@@ -244,9 +244,16 @@ class ScanWorker(QThread):
     # Boundary walking parametreleri
     EDGE_STEP_METERS = 10  # Kenar boyunca adim (metre)
     OUTWARD_STEP_METERS = 8  # Kenardan disa adim (metre)
+    BOUNDARY_WALK_MAX_ITERATIONS = 5  # Sonsuz dongu korunmasi
+    MIN_EDGE_LENGTH_METERS = 1  # Bu uzunluktan kisa kenarlar atlanir
 
     # Gap filling parametreleri
     GAP_FILL_STEP_DIVISOR = 2  # step_meters / bu deger = gap fill adimi
+    MIN_GAP_FILL_STEP = 5  # Minimum gap fill grid adimi (metre)
+
+    # Refine (detaylandirma) parametreleri
+    MIN_REFINE_STEP = 5  # Minimum detaylandirma grid adimi (metre)
+    REFINE_STEP_DIVISOR = 3  # step_meters / bu deger = detaylandirma adimi
 
     progress = pyqtSignal(int, int)  # current, total
     stats_update = pyqtSignal(dict)  # Detayli istatistikler
@@ -277,6 +284,20 @@ class ScanWorker(QThread):
         self.current_phase = ""
         self.null_responses = 0  # API'den parsel bulunamadi yaniti
         self.failed_points = 0   # Ag hatasi nedeniyle sorgulanamayan noktalar
+
+    @staticmethod
+    def get_parcel_id(result: dict, point: Tuple[float, float]) -> str:
+        """Parsel ID'sini dondurur (ozet veya koordinat bazli fallback)."""
+        if result and 'properties' in result:
+            ozet = result['properties'].get('ozet')
+            if ozet:
+                return ozet
+        return f"{point[0]:.6f}_{point[1]:.6f}"
+
+    @staticmethod
+    def geojson_coords_to_poly(coords: list) -> List[Tuple[float, float]]:
+        """GeoJSON koordinatlarini (lon, lat) -> (lat, lon) tuple listesine donusturur."""
+        return [(c[1], c[0]) for c in coords]
 
     def _emit_stats(self):
         """Guncel istatistikleri UI'a gonderir."""
@@ -398,9 +419,8 @@ class ScanWorker(QThread):
 
         # Her parseli bir kez yuru
         iteration = 0
-        max_iterations = 5  # Sonsuz dongu korunmasi
 
-        while parcels_to_walk and self.is_running and iteration < max_iterations:
+        while parcels_to_walk and self.is_running and iteration < self.BOUNDARY_WALK_MAX_ITERATIONS:
             iteration += 1
             current_batch = list(parcels_to_walk)
             parcels_to_walk.clear()
@@ -412,9 +432,13 @@ class ScanWorker(QThread):
                 if not self.is_running:
                     break
 
-                # Parsel hash'i (ilk 3 koordinat - daha guvenilir)
-                hash_coords = parcel_poly[:3] if len(parcel_poly) >= 3 else parcel_poly
-                poly_hash = "_".join(f"{c[0]:.5f},{c[1]:.5f}" for c in hash_coords)
+                # Parsel hash'i (centroid + alan - en guvenilir)
+                # Centroid hesapla
+                lats = [c[0] for c in parcel_poly]
+                lons = [c[1] for c in parcel_poly]
+                centroid_lat = sum(lats) / len(lats)
+                centroid_lon = sum(lons) / len(lons)
+                poly_hash = f"{centroid_lat:.5f}_{centroid_lon:.5f}_{len(parcel_poly)}"
                 if poly_hash in walked_parcels:
                     continue
                 walked_parcels.add(poly_hash)
@@ -460,7 +484,7 @@ class ScanWorker(QThread):
         found_count = 0
 
         # Daha yogun grid adimi
-        dense_step = max(5, self.step_meters // self.GAP_FILL_STEP_DIVISOR)
+        dense_step = max(self.MIN_GAP_FILL_STEP, self.step_meters // self.GAP_FILL_STEP_DIVISOR)
         self.log.emit(f"  Yogun grid adimi: {dense_step}m")
 
         # Polygon bounding box
@@ -531,22 +555,25 @@ class ScanWorker(QThread):
             lon_diff = (p2[1] - p1[1]) * 111000 * math.cos(math.radians(edge_lat))
             edge_length = math.sqrt(lat_diff**2 + lon_diff**2)
 
-            if edge_length < 1:  # Cok kisa kenar
+            if edge_length < self.MIN_EDGE_LENGTH_METERS:
                 continue
 
             # Kenar boyunca noktalar
             num_points = max(1, int(edge_length / self.EDGE_STEP_METERS))
 
             for j in range(num_points + 1):
-                t = j / max(num_points, 1)
+                # num_points her zaman >= 1 (max(1, ...) ile tanimli)
+                t = j / num_points
                 mid_lat = p1[0] + t * (p2[0] - p1[0])
                 mid_lon = p1[1] + t * (p2[1] - p1[1])
 
                 # Normal vektor (kenardan disa dogru)
+                # Kenar vektoru: (lat_diff, lon_diff)
+                # Normal vektor: 90 derece saat yonunde dondurmek icin (-lon, lat)
+                # Bu sayede nx enlem yonunde, ny boylam yonunde disa dogru adim saglar
                 if edge_length > 0:
-                    # Kenar yonune dik vektor
-                    nx = -lon_diff / edge_length  # lat yonunde
-                    ny = lat_diff / edge_length   # lon yonunde
+                    nx = -lon_diff / edge_length  # Enlem yonundeki birim normal
+                    ny = lat_diff / edge_length   # Boylam yonundeki birim normal
 
                     # Disa dogru adim (her iki yon)
                     outward_lat = self.OUTWARD_STEP_METERS / 111000
@@ -583,8 +610,7 @@ class ScanWorker(QThread):
 
             for i, result in enumerate(results):
                 if result and 'properties' in result:
-                    fallback_id = f"{batch[i][0]:.6f}_{batch[i][1]:.6f}"
-                    parsel_id = result['properties'].get('ozet') or fallback_id
+                    parsel_id = self.get_parcel_id(result, batch[i])
 
                     if parsel_id not in self.found_ids:
                         self.found_ids.add(parsel_id)
@@ -596,8 +622,7 @@ class ScanWorker(QThread):
                         # Geometriyi kaydet (pruning icin)
                         if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
                             coords = result['geometry'].get('coordinates', [[]])[0]
-                            parcel_poly = [(c[1], c[0]) for c in coords]
-                            self.found_parcels.append(parcel_poly)
+                            self.found_parcels.append(self.geojson_coords_to_poly(coords))
 
             time.sleep(self.delay)
 
@@ -662,8 +687,7 @@ class ScanWorker(QThread):
 
         for i, result in enumerate(results):
             if result and 'properties' in result:
-                fallback_id = f"{valid_points[i][0]:.6f}_{valid_points[i][1]:.6f}"
-                parsel_id = result['properties'].get('ozet') or fallback_id
+                parsel_id = self.get_parcel_id(result, valid_points[i])
 
                 if parsel_id not in self.found_ids:
                     self.found_ids.add(parsel_id)
@@ -675,8 +699,7 @@ class ScanWorker(QThread):
                     # Geometriyi kaydet (pruning icin)
                     if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
                         coords = result['geometry'].get('coordinates', [[]])[0]
-                        parcel_poly = [(c[1], c[0]) for c in coords]
-                        self.found_parcels.append(parcel_poly)
+                        self.found_parcels.append(self.geojson_coords_to_poly(coords))
 
                 unique_parcels.add(parsel_id)
 
@@ -715,8 +738,7 @@ class ScanWorker(QThread):
 
             for i, result in enumerate(results):
                 if result and 'properties' in result:
-                    fallback_id = f"{batch[i][0]:.6f}_{batch[i][1]:.6f}"
-                    parsel_id = result['properties'].get('ozet') or fallback_id
+                    parsel_id = self.get_parcel_id(result, batch[i])
 
                     if parsel_id not in self.found_ids:
                         self.found_ids.add(parsel_id)
@@ -727,8 +749,7 @@ class ScanWorker(QThread):
 
                         if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
                             coords = result['geometry'].get('coordinates', [[]])[0]
-                            parcel_poly = [(c[1], c[0]) for c in coords]
-                            self.found_parcels.append(parcel_poly)
+                            self.found_parcels.append(self.geojson_coords_to_poly(coords))
 
             time.sleep(self.delay)
 
@@ -1122,8 +1143,7 @@ class MainWindow(QMainWindow):
                 self.worker.found_ids.add(parsel_id)
                 if 'geometry' in data and data['geometry'].get('type') == 'Polygon':
                     coords = data['geometry'].get('coordinates', [[]])[0]
-                    parcel_poly = [(c[1], c[0]) for c in coords]
-                    self.worker.found_parcels.append(parcel_poly)
+                    self.worker.found_parcels.append(ScanWorker.geojson_coords_to_poly(coords))
 
         # Sinyalleri bagla
         self.worker.progress.connect(self.on_progress)
@@ -1214,8 +1234,11 @@ class MainWindow(QMainWindow):
         if not url:
             return
 
-        # Daha yogun grid (mevcut step'in 1/3'u, min 5m)
-        refined_step = max(5, self.step_spin.value() // 3)
+        # Daha yogun grid (mevcut step'in 1/3'u)
+        refined_step = max(
+            ScanWorker.MIN_REFINE_STEP,
+            self.step_spin.value() // ScanWorker.REFINE_STEP_DIVISOR
+        )
 
         self.log("\n=== DETAYLANDIRMA TARAMASI ===")
         self.log(f"Yogun grid adimi: {refined_step}m (onceki: {self.step_spin.value()}m)")

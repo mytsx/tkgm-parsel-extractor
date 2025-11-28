@@ -423,8 +423,6 @@ class ScanWorker(QThread):
                 self.points_remaining = len(cells_to_process)
                 self._emit_stats()
 
-            time.sleep(self.delay)
-
         return found_count
 
     def _phase2_boundary_walk(self, polygon: List[Tuple[float, float]]) -> int:
@@ -494,8 +492,6 @@ class ScanWorker(QThread):
                     for poly in self.found_parcels[-num_new_polys:]:
                         parcels_to_walk.append(poly)
 
-                time.sleep(self.delay)
-
             # Progress guncelle (FAZ 2 icin %50-75)
             progress_pct = 50 + min(25, iteration * 5)
             self.progress.emit(progress_pct, 100)
@@ -564,8 +560,6 @@ class ScanWorker(QThread):
                 self.log.emit(f"  Batch {batch_num}/{total_batches} - {found_count} yeni parsel")
                 self.points_remaining = len(remaining)
                 self._emit_stats()
-
-            time.sleep(self.delay)
 
         return found_count
 
@@ -654,8 +648,6 @@ class ScanWorker(QThread):
                     _, is_new = self._process_found_parcel(result, batch[i])
                     if is_new:
                         new_count += 1
-
-            time.sleep(self.delay)
 
         return new_count
 
@@ -761,8 +753,6 @@ class ScanWorker(QThread):
                     _, is_new = self._process_found_parcel(result, batch[i])
                     if is_new:
                         new_count += 1
-
-            time.sleep(self.delay)
 
         return False, new_count
 
@@ -944,12 +934,12 @@ class MainWindow(QMainWindow):
         grid_layout.addWidget(self.step_spin)
         settings_layout.addLayout(grid_layout)
 
-        # Bekleme
+        # Retry bekleme (sadece hata durumunda)
         delay_layout = QVBoxLayout()
-        delay_layout.addWidget(BodyLabel("Bekleme Suresi (sn)"))
+        delay_layout.addWidget(BodyLabel("Retry Bekleme (sn)"))
         self.delay_spin = DoubleSpinBox()
         self.delay_spin.setRange(0.1, 5.0)
-        self.delay_spin.setValue(0.3)
+        self.delay_spin.setValue(0.5)
         self.delay_spin.setSingleStep(0.1)
         delay_layout.addWidget(self.delay_spin)
         settings_layout.addLayout(delay_layout)

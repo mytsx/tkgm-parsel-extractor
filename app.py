@@ -140,8 +140,9 @@ class TKGMClient:
         Args:
             coordinates: [(lat, lon), (lat, lon), ...] listesi
         Returns:
-            (results_list, error_code) tuple
+            (results_list, meta_dict, error_code) tuple
             results_list: [{data}, {data}, ...] veya None'lar
+            meta_dict: {"count": N, "success": M, "failed": K}
         """
         try:
             url = f"{self.worker_url}/batch"
@@ -153,19 +154,36 @@ class TKGMClient:
             if response.status_code == 200:
                 data = response.json()
                 results = data.get('results', [])
+                count = data.get('count', len(results))
+                success = data.get('success', 0)
+
                 # Her sonucu kontrol et, gecerli parsel mi?
                 processed = []
+                actual_success = 0
                 for r in results:
                     if r and isinstance(r, dict) and 'properties' in r:
                         processed.append(r)
+                        actual_success += 1
                     else:
                         processed.append(None)
-                return processed, None
+
+                meta = {
+                    "count": count,
+                    "success": actual_success,
+                    "empty": count - actual_success,
+                    "worker_success": success  # Worker'ın raporladığı
+                }
+                return processed, meta, None
+
             if response.status_code == 401:
-                return None, 401
-            return None, response.status_code
+                return None, None, 401
+            if response.status_code == 429:
+                return None, {"rate_limited": True}, 429
+            return None, None, response.status_code
+        except requests.Timeout:
+            return None, {"timeout": True}, "TIMEOUT"
         except requests.RequestException as e:
-            return None, str(e)
+            return None, {"error": str(e)}, str(e)
 
 
 # ==================== QUADTREE ====================
@@ -366,20 +384,20 @@ class ScanWorker(QThread):
             "failed_points": self.failed_points
         })
 
-    def _query_batch_single(self, points: List[Tuple[float, float]]) -> Tuple[List, Optional[int]]:
+    def _query_batch_single(self, points: List[Tuple[float, float]]) -> Tuple[List, dict, Optional[any]]:
         """Tek batch sorgusu (paralel calisma icin)."""
         try:
-            results, error = self.client.get_batch(points)
+            results, meta, error = self.client.get_batch(points)
             if error == 401:
-                return [], 401
+                return [], {}, 401
             if error:
-                return [], error
-            return results or [], None
+                return [], meta or {}, error
+            return results or [], meta or {}, None
         except Exception as e:
-            return [], str(e)
+            return [], {"exception": str(e)}, str(e)
 
     def _query_parallel(self, all_points: List[Tuple[float, float]]) -> int:
-        """Paralel batch sorgulari yapar."""
+        """Paralel batch sorgulari yapar - retry destekli."""
         if not all_points:
             return 0
 
@@ -398,24 +416,32 @@ class ScanWorker(QThread):
         new_count = 0
         total_batches = len(batches)
         processed = 0
+        retry_queue = []  # Basarisiz batch'ler icin
 
         # Paralel istek gonder
         with ThreadPoolExecutor(max_workers=self.PARALLEL_BATCHES) as executor:
-            # Batch'leri siraya koy
             future_to_batch = {}
             batch_idx = 0
+            last_submit_time = 0
 
             while batch_idx < len(batches) or future_to_batch:
                 if not self.is_running:
                     break
 
                 # Yeni batch'ler ekle (max PARALLEL_BATCHES kadar)
+                # Her batch arasinda kucuk delay (rate limit onleme)
                 while batch_idx < len(batches) and len(future_to_batch) < self.PARALLEL_BATCHES:
+                    # 50ms delay between submissions
+                    current_time = time.time()
+                    if current_time - last_submit_time < 0.05:
+                        time.sleep(0.05 - (current_time - last_submit_time))
+
                     batch = batches[batch_idx]
                     self._mark_as_queried(batch)
                     future = executor.submit(self._query_batch_single, batch)
-                    future_to_batch[future] = (batch_idx, batch)
+                    future_to_batch[future] = (batch_idx, batch, 0)  # 0 = retry count
                     batch_idx += 1
+                    last_submit_time = time.time()
                     self.api_calls += 1
                     self.total_points_queried += len(batch)
 
@@ -423,21 +449,31 @@ class ScanWorker(QThread):
                 done_futures = [f for f in future_to_batch if f.done()]
 
                 for future in done_futures:
-                    idx, batch = future_to_batch.pop(future)
+                    _, batch, retry_count = future_to_batch.pop(future)
                     processed += 1
 
                     try:
-                        results, error = future.result()
+                        results, _meta, error = future.result()
 
                         if error == 401:
                             self.auth_error.emit()
                             self.is_running = False
                             return new_count
 
+                        # Rate limit veya timeout - retry'a ekle
+                        if error == 429 or error == "TIMEOUT":
+                            if retry_count < 2:
+                                retry_queue.append((batch, retry_count + 1))
+                                self.log.emit(f"  ⚠ Rate limit/timeout, retry kuyruğuna eklendi")
+                            else:
+                                self.failed_points += len(batch)
+                            continue
+
                         if error:
                             self.failed_points += len(batch)
                             continue
 
+                        # Sonuclari isle
                         for i, result in enumerate(results):
                             if result and 'properties' in result:
                                 if self._process_result(result, batch[i]):
@@ -456,6 +492,30 @@ class ScanWorker(QThread):
                 # Kisa bekleme (CPU kullanimi icin)
                 if not done_futures:
                     time.sleep(0.01)
+
+        # Retry queue'yu isle (rate limit sonrasi)
+        if retry_queue and self.is_running:
+            self.log.emit(f"  Retry: {len(retry_queue)} batch tekrar deneniyor...")
+            time.sleep(1)  # Rate limit icin bekle
+
+            for batch, _retry_count in retry_queue:
+                if not self.is_running:
+                    break
+
+                time.sleep(0.2)  # Her retry arasinda bekle
+                results, _meta, error = self._query_batch_single(batch)
+                self.api_calls += 1
+
+                if error:
+                    self.failed_points += len(batch)
+                    continue
+
+                for i, result in enumerate(results):
+                    if result and 'properties' in result:
+                        if self._process_result(result, batch[i]):
+                            new_count += 1
+                    else:
+                        self.null_responses += 1
 
         return new_count
 

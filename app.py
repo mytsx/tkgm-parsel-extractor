@@ -13,21 +13,22 @@ from collections import deque
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Set, Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QFileDialog
+    QFileDialog, QButtonGroup
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings
 
 # Fluent Widgets
 from qfluentwidgets import (
     PushButton, PrimaryPushButton, LineEdit, BodyLabel, TitleLabel,
-    SubtitleLabel, CardWidget, ProgressBar, TextEdit,
-    SpinBox, DoubleSpinBox, InfoBar, InfoBarPosition, FluentIcon,
-    setTheme, Theme
+    SubtitleLabel, CardWidget, ProgressBar, TextEdit, RadioButton,
+    InfoBar, InfoBarPosition, FluentIcon, setTheme, Theme
 )
 
 import requests
@@ -233,113 +234,349 @@ class QuadTreeNode:
         self.is_leaf = False
 
 
-# ==================== WORKER THREAD ====================
+# ==================== TARAMA KALİTESİ ====================
+
+class ScanQuality(Enum):
+    """Tarama kalite seviyeleri."""
+    FAST = "fast"           # Hizli - buyuk alanlar icin
+    BALANCED = "balanced"   # Dengeli - onerilen
+    DETAILED = "detailed"   # Detayli - kucuk parseller icin
+
+
+# ==================== SMART SCAN WORKER ====================
 
 class ScanWorker(QThread):
-    """Arka planda alan taramasi yapan worker thread - Quadtree + Grid + Boundary Walking hibrit."""
+    """
+    Akilli tarama algoritmasi:
+    - Global queried_coords seti (ayni nokta 2 kez sorgulanmaz)
+    - Paralel batch istekleri (5-10x hiz artisi)
+    - Adaptif grid (kaba -> yogun)
+    - Otomatik parametre secimi
+    """
 
-    # Worker tarafinda MAX_BATCH_COORDS=20 limiti var, bu degerden kucuk tutulmali
+    # Batch boyutu (Worker limiti 20)
     BATCH_SIZE = 15
 
-    # Boundary walking parametreleri
-    EDGE_STEP_METERS = 10  # Kenar boyunca adim (metre)
-    OUTWARD_STEP_METERS = 8  # Kenardan disa adim (metre)
-    BOUNDARY_WALK_MAX_ITERATIONS = 5  # Sonsuz dongu korunmasi
-    MIN_EDGE_LENGTH_METERS = 1  # Bu uzunluktan kisa kenarlar atlanir
+    # Paralel istek sayisi
+    PARALLEL_BATCHES = 5
 
-    # Gap filling parametreleri
-    GAP_FILL_STEP_DIVISOR = 2  # step_meters / bu deger = gap fill adimi
-    MIN_GAP_FILL_STEP = 5  # Minimum gap fill grid adimi (metre)
+    # Kalite seviyeleri: (kaba_grid, yogun_grid, boundary_step)
+    QUALITY_SETTINGS = {
+        ScanQuality.FAST: (100, 40, 15),
+        ScanQuality.BALANCED: (60, 20, 10),
+        ScanQuality.DETAILED: (40, 10, 5),
+    }
 
-    # Refine (detaylandirma) parametreleri
-    MIN_REFINE_STEP = 5  # Minimum detaylandirma grid adimi (metre)
-    REFINE_STEP_DIVISOR = 3  # step_meters / bu deger = detaylandirma adimi
+    # Koordinat yuvarlamasi (tekrar sorgu onleme icin)
+    COORD_PRECISION = 6  # ~11cm hassasiyet
 
-    progress = pyqtSignal(int, int)  # current, total
-    stats_update = pyqtSignal(dict)  # Detayli istatistikler
+    # Sinyaller
+    progress = pyqtSignal(int, int)
+    stats_update = pyqtSignal(dict)
     log = pyqtSignal(str)
     parcel_found = pyqtSignal(str, dict)
     finished_scan = pyqtSignal(int)
-    auth_error = pyqtSignal()  # 401 hatasi icin
+    auth_error = pyqtSignal()
 
-    def __init__(self, client: TKGMClient, polygons: List, step_meters: int, delay: float):
-        """Tarama worker'i olusturur."""
+    def __init__(self, client: TKGMClient, polygons: List, quality: ScanQuality = ScanQuality.BALANCED):
+        """Akilli tarama worker'i olusturur."""
         super().__init__()
         self.client = client
         self.polygons = polygons
-        self.step_meters = step_meters
-        self.delay = delay
+        self.quality = quality
         self.is_running = True
 
-        # Tarama istatistikleri
-        self.found_ids = set()
-        self.found_parcels = []  # Bulunan parsel geometrileri (pruning icin)
+        # Kalite ayarlarini al
+        self.coarse_step, self.dense_step, self.boundary_step = self.QUALITY_SETTINGS[quality]
+
+        # *** GLOBAL SORGULANAN KOORDİNATLAR - ASLA TEKRAR SORGULANMAZ ***
+        self.queried_coords: Set[Tuple[int, int]] = set()
+
+        # Bulunan parseller
+        self.found_ids: Set[str] = set()
+        self.found_parcels: List[List[Tuple[float, float]]] = []  # Geometriler
+
+        # Istatistikler
         self.api_calls = 0
-        self.cells_processed = 0
-        self.cells_skipped = 0
-        self.boundary_walks = 0
-        self.gap_fill_points = 0
         self.total_points_queried = 0
+        self.duplicate_skipped = 0  # Tekrar sorgu engellenen
         self.points_remaining = 0
         self.current_phase = ""
-        self.null_responses = 0  # API'den parsel bulunamadi yaniti
-        self.failed_points = 0   # Ag hatasi nedeniyle sorgulanamayan noktalar
+        self.null_responses = 0
+        self.failed_points = 0
 
-    @staticmethod
-    def get_parcel_id(result: dict, point: Tuple[float, float]) -> str:
-        """Parsel ID'sini dondurur (ozet veya koordinat bazli fallback)."""
-        if result and 'properties' in result:
-            ozet = result['properties'].get('ozet')
-            if ozet:
-                return ozet
-        return f"{point[0]:.6f}_{point[1]:.6f}"
+    def _coord_key(self, lat: float, lon: float) -> Tuple[int, int]:
+        """Koordinati hash key'e cevirir (yuvarlanmis integer)."""
+        # 6 decimal = ~11cm hassasiyet
+        return (round(lat * 10**self.COORD_PRECISION),
+                round(lon * 10**self.COORD_PRECISION))
+
+    def _filter_new_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Daha once sorgulanmamis noktalari filtreler."""
+        new_points = []
+        for lat, lon in points:
+            key = self._coord_key(lat, lon)
+            if key not in self.queried_coords:
+                new_points.append((lat, lon))
+        return new_points
+
+    def _mark_as_queried(self, points: List[Tuple[float, float]]):
+        """Noktalari sorgulandi olarak isaretler."""
+        for lat, lon in points:
+            self.queried_coords.add(self._coord_key(lat, lon))
 
     @staticmethod
     def geojson_coords_to_poly(coords: list) -> List[Tuple[float, float]]:
         """GeoJSON koordinatlarini (lon, lat) -> (lat, lon) tuple listesine donusturur."""
         return [(c[1], c[0]) for c in coords]
 
-    def _process_found_parcel(self, result: dict, point: Tuple[float, float]) -> Tuple[str, bool]:
-        """
-        Parsel sonucunu isler. Bulunduysa ID'sini ve yeni olup olmadigini dondurur.
-        Returns: (parsel_id, is_new)
-        """
-        parsel_id = self.get_parcel_id(result, point)
-        is_new = False
+    def _process_result(self, result: dict, point: Tuple[float, float]) -> bool:
+        """Sonucu isle, yeni parsel mi dondur."""
+        if not result or 'properties' not in result:
+            return False
 
-        if parsel_id not in self.found_ids:
-            is_new = True
-            self.found_ids.add(parsel_id)
-            self.parcel_found.emit(parsel_id, result)
-            props = result['properties']
-            self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
+        props = result['properties']
+        parsel_id = props.get('ozet', f"{point[0]:.6f}_{point[1]:.6f}")
 
-            # Geometriyi kaydet (pruning icin) - en az 3 nokta olmali
-            if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
-                coord_list = result['geometry'].get('coordinates') or []
-                if coord_list and len(coord_list[0]) >= 3:
-                    self.found_parcels.append(self.geojson_coords_to_poly(coord_list[0]))
+        if parsel_id in self.found_ids:
+            return False
 
-        return parsel_id, is_new
+        self.found_ids.add(parsel_id)
+        self.parcel_found.emit(parsel_id, result)
+        self.log.emit(f"  ✓ {parsel_id} - {props.get('nitelik', '')} ({props.get('alan', '')})")
+
+        # Geometriyi kaydet
+        if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
+            coords = result['geometry'].get('coordinates', [[]])
+            if coords and len(coords[0]) >= 3:
+                self.found_parcels.append(self.geojson_coords_to_poly(coords[0]))
+
+        return True
 
     def _emit_stats(self):
-        """Guncel istatistikleri UI'a gonderir."""
+        """UI'a istatistik gonder."""
         self.stats_update.emit({
             "phase": self.current_phase,
             "found": len(self.found_ids),
             "api_calls": self.api_calls,
             "queried": self.total_points_queried,
             "remaining": self.points_remaining,
+            "skipped": self.duplicate_skipped,
             "null_responses": self.null_responses,
             "failed_points": self.failed_points
         })
 
-    def run(self):
-        """Hibrit Quadtree + Grid + Boundary Walking + Gap Fill tarama algoritmasi."""
-        self.log.emit("=== Hibrit Tarama Algoritmasi ===")
-        self.log.emit(f"Grid boyutu: {self.step_meters}m, Minimum hucre: {QuadTreeNode.MIN_CELL_SIZE}m")
+    def _query_batch_single(self, points: List[Tuple[float, float]]) -> Tuple[List, Optional[int]]:
+        """Tek batch sorgusu (paralel calisma icin)."""
+        try:
+            results, error = self.client.get_batch(points)
+            if error == 401:
+                return [], 401
+            if error:
+                return [], error
+            return results or [], None
+        except Exception as e:
+            return [], str(e)
 
-        found_count = 0
+    def _query_parallel(self, all_points: List[Tuple[float, float]]) -> int:
+        """Paralel batch sorgulari yapar."""
+        if not all_points:
+            return 0
+
+        # Tekrar sorgulanacak noktalari filtrele
+        new_points = self._filter_new_points(all_points)
+        self.duplicate_skipped += len(all_points) - len(new_points)
+
+        if not new_points:
+            return 0
+
+        # Batch'lere bol
+        batches = []
+        for i in range(0, len(new_points), self.BATCH_SIZE):
+            batches.append(new_points[i:i + self.BATCH_SIZE])
+
+        new_count = 0
+        total_batches = len(batches)
+        processed = 0
+
+        # Paralel istek gonder
+        with ThreadPoolExecutor(max_workers=self.PARALLEL_BATCHES) as executor:
+            # Batch'leri siraya koy
+            future_to_batch = {}
+            batch_idx = 0
+
+            while batch_idx < len(batches) or future_to_batch:
+                if not self.is_running:
+                    break
+
+                # Yeni batch'ler ekle (max PARALLEL_BATCHES kadar)
+                while batch_idx < len(batches) and len(future_to_batch) < self.PARALLEL_BATCHES:
+                    batch = batches[batch_idx]
+                    self._mark_as_queried(batch)
+                    future = executor.submit(self._query_batch_single, batch)
+                    future_to_batch[future] = (batch_idx, batch)
+                    batch_idx += 1
+                    self.api_calls += 1
+                    self.total_points_queried += len(batch)
+
+                # Tamamlanan future'lari isle
+                done_futures = [f for f in future_to_batch if f.done()]
+
+                for future in done_futures:
+                    idx, batch = future_to_batch.pop(future)
+                    processed += 1
+
+                    try:
+                        results, error = future.result()
+
+                        if error == 401:
+                            self.auth_error.emit()
+                            self.is_running = False
+                            return new_count
+
+                        if error:
+                            self.failed_points += len(batch)
+                            continue
+
+                        for i, result in enumerate(results):
+                            if result and 'properties' in result:
+                                if self._process_result(result, batch[i]):
+                                    new_count += 1
+                            else:
+                                self.null_responses += 1
+
+                    except Exception:
+                        self.failed_points += len(batch)
+
+                # Progress guncelle
+                if processed % 5 == 0:
+                    self.points_remaining = (total_batches - processed) * self.BATCH_SIZE
+                    self._emit_stats()
+
+                # Kisa bekleme (CPU kullanimi icin)
+                if not done_futures:
+                    time.sleep(0.01)
+
+        return new_count
+
+    def _generate_grid(self, polygon: List[Tuple[float, float]], step_meters: int) -> List[Tuple[float, float]]:
+        """Grid noktalari olustur."""
+        bbox = KMLParser.get_bounding_box(polygon)
+        center_lat = (bbox.min_lat + bbox.max_lat) / 2
+
+        lat_step = step_meters / 111000
+        lon_step = step_meters / (111000 * math.cos(math.radians(center_lat)))
+
+        points = []
+        lat = bbox.min_lat
+        while lat <= bbox.max_lat:
+            lon = bbox.min_lon
+            while lon <= bbox.max_lon:
+                if KMLParser.point_in_polygon(lat, lon, polygon):
+                    points.append((lat, lon))
+                lon += lon_step
+            lat += lat_step
+
+        return points
+
+    def _generate_boundary_points(self, polygon: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """KML polygon siniri boyunca noktalar olustur."""
+        points = []
+        n = len(polygon)
+
+        for i in range(n):
+            p1 = polygon[i]
+            p2 = polygon[(i + 1) % n]
+
+            # Kenar uzunlugu
+            edge_lat = (p1[0] + p2[0]) / 2
+            lat_diff = (p2[0] - p1[0]) * 111000
+            lon_diff = (p2[1] - p1[1]) * 111000 * math.cos(math.radians(edge_lat))
+            edge_length = math.sqrt(lat_diff**2 + lon_diff**2)
+
+            if edge_length < 1:
+                continue
+
+            # Kenar boyunca noktalar
+            num_points = max(1, int(edge_length / self.boundary_step))
+
+            for j in range(num_points + 1):
+                t = j / max(num_points, 1)
+                lat = p1[0] + t * (p2[0] - p1[0])
+                lon = p1[1] + t * (p2[1] - p1[1])
+                points.append((lat, lon))
+
+        return points
+
+    def _extract_parcel_edge_points(self, parcel_poly: List[Tuple[float, float]],
+                                     search_polygon: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Parsel kenarlarindan disa noktalar cikar."""
+        edge_points = []
+        n = len(parcel_poly)
+        outward_step = 8  # metre
+
+        is_closed = (n >= 2 and parcel_poly[0] == parcel_poly[-1])
+        edge_count = n - 1 if is_closed else n
+
+        for i in range(edge_count):
+            p1 = parcel_poly[i]
+            p2 = parcel_poly[(i + 1) % n]
+
+            edge_lat = (p1[0] + p2[0]) / 2
+            lat_diff = (p2[0] - p1[0]) * 111000
+            lon_diff = (p2[1] - p1[1]) * 111000 * math.cos(math.radians(edge_lat))
+            edge_length = math.sqrt(lat_diff**2 + lon_diff**2)
+
+            if edge_length < 1:
+                continue
+
+            num_points = max(1, int(edge_length / self.boundary_step))
+
+            for j in range(num_points + 1):
+                t = j / max(num_points, 1)
+                mid_lat = p1[0] + t * (p2[0] - p1[0])
+                mid_lon = p1[1] + t * (p2[1] - p1[1])
+
+                # Normal vektor
+                normal_x = lat_diff / edge_length
+                normal_y = -lon_diff / edge_length
+
+                for direction in [1, -1]:
+                    delta_lat = direction * outward_step * normal_y / 111000
+                    delta_lon = direction * outward_step * normal_x / (111000 * math.cos(math.radians(mid_lat)))
+
+                    new_lat = mid_lat + delta_lat
+                    new_lon = mid_lon + delta_lon
+
+                    if (KMLParser.point_in_polygon(new_lat, new_lon, search_polygon) and
+                            not KMLParser.point_in_polygon(new_lat, new_lon, parcel_poly)):
+                        edge_points.append((new_lat, new_lon))
+
+        return edge_points
+
+    def _prune_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Bulunan parsellerin icindeki noktalari filtrele."""
+        if not self.found_parcels:
+            return points
+        return [p for p in points
+                if not any(KMLParser.point_in_polygon(p[0], p[1], poly) for poly in self.found_parcels)]
+
+    def run(self):
+        """Ana tarama algoritmasi."""
+        quality_names = {
+            ScanQuality.FAST: "Hizli",
+            ScanQuality.BALANCED: "Dengeli",
+            ScanQuality.DETAILED: "Detayli"
+        }
+
+        self.log.emit("=" * 50)
+        self.log.emit("AKILLI TARAMA ALGORITMASI")
+        self.log.emit("=" * 50)
+        self.log.emit(f"Kalite: {quality_names[self.quality]}")
+        self.log.emit(f"Kaba grid: {self.coarse_step}m, Yogun grid: {self.dense_step}m")
+        self.log.emit(f"Paralel istek: {self.PARALLEL_BATCHES}")
+
+        total_found = 0
 
         for poly_idx, polygon in enumerate(self.polygons):
             if not self.is_running:
@@ -347,486 +584,113 @@ class ScanWorker(QThread):
 
             self.log.emit(f"\n{'='*50}")
             self.log.emit(f"Polygon {poly_idx + 1}/{len(self.polygons)}")
-            self.log.emit("="*50)
+            self.log.emit("=" * 50)
 
-            # === FAZ 1: Quadtree + Grid Tarama ===
-            self.log.emit("\n[FAZ 1] Quadtree + Grid tarama basliyor...")
-            phase1_count = self._phase1_quadtree_scan(polygon)
-            found_count += phase1_count
-            self.log.emit(f"[FAZ 1] Tamamlandi: {phase1_count} parsel bulundu")
+            # === FAZ 1: KABA GRID ===
+            self.current_phase = "Kaba Grid"
+            self.log.emit(f"\n[FAZ 1] Kaba grid tarama ({self.coarse_step}m)...")
 
-            if not self.is_running:
-                break
+            coarse_points = self._generate_grid(polygon, self.coarse_step)
+            self.log.emit(f"  {len(coarse_points)} nokta olusturuldu")
 
-            # === FAZ 2: Boundary Walking ===
-            self.log.emit("\n[FAZ 2] Sinir takibi (Boundary Walking) basliyor...")
-            phase2_count = self._phase2_boundary_walk(polygon)
-            found_count += phase2_count
-            self.log.emit(f"[FAZ 2] Tamamlandi: {phase2_count} yeni parsel bulundu")
+            phase1 = self._query_parallel(coarse_points)
+            total_found += phase1
+            self.log.emit(f"[FAZ 1] Tamamlandi: {phase1} parsel")
+            self.progress.emit(30, 100)
 
             if not self.is_running:
                 break
 
-            # === FAZ 3: Gap Filling ===
-            self.log.emit("\n[FAZ 3] Bosluk doldurma (Gap Fill) basliyor...")
-            phase3_count = self._phase3_gap_fill(polygon)
-            found_count += phase3_count
-            self.log.emit(f"[FAZ 3] Tamamlandi: {phase3_count} yeni parsel bulundu")
-
-        if not self.is_running:
-            self.log.emit("Tarama durduruldu")
-
-        self.progress.emit(100, 100)
-        self._log_summary(found_count)
-        self.finished_scan.emit(found_count)
-
-    def _phase1_quadtree_scan(self, polygon: List[Tuple[float, float]]) -> int:
-        """FAZ 1: Quadtree + Grid hibrit tarama."""
-        self.current_phase = "Quadtree"
-        found_count = 0
-
-        # Polygon icin quadtree olustur
-        bbox = KMLParser.get_bounding_box(polygon)
-        root = QuadTreeNode(bbox.min_lat, bbox.max_lat, bbox.min_lon, bbox.max_lon)
-
-        # Quadtree tarama
-        cells_to_process = deque([root])
-        estimated_total = 100  # Tahmini ilerleme icin
-
-        while cells_to_process and self.is_running:
-            cell = cells_to_process.popleft()
-
-            # Hucrenin polygon ile kesisimini kontrol et
-            if not self._cell_intersects_polygon(cell, polygon):
-                self.cells_skipped += 1
-                continue
-
-            # Hucreyi tara
-            should_subdivide, new_parcels = self._scan_cell(cell, polygon)
+            # === FAZ 2: SINIR TARMA (KML + Parseller) ===
+            self.current_phase = "Sinir"
+            self.log.emit(f"\n[FAZ 2] Sinir tarama...")
 
-            found_count += new_parcels
-            self.cells_processed += 1
-
-            # Progress guncelle (FAZ 1 icin %0-50)
-            progress_pct = min(50, int((self.cells_processed / max(estimated_total, 1)) * 50))
-            self.progress.emit(progress_pct, 100)
-
-            if should_subdivide and cell.can_subdivide():
-                # Hucreyi bol ve alt hucreleri kuyruğa ekle
-                cell.subdivide()
-                for child in cell.children:
-                    cells_to_process.append(child)
-                estimated_total += 3  # 1 hucre -> 4 hucre, net +3
-
-            # Her 5 hucrede bir stats guncelle
-            if self.cells_processed % 5 == 0:
-                self.points_remaining = len(cells_to_process)
-                self._emit_stats()
-
-        return found_count
-
-    def _phase2_boundary_walk(self, polygon: List[Tuple[float, float]]) -> int:
-        """FAZ 2: Sinir takibi - bulunan parsellerin kenarlarindan disa yuruyerek komsulari bul."""
-        self.current_phase = "Boundary"
-        found_count = 0
-
-        if not self.found_parcels:
-            self.log.emit("  Sinir takibi icin parsel yok, atlaniyor...")
-            return 0
-
-        # BFS kuyrugu - isle ve yeni bulunan parselleri de ekle
-        parcels_to_walk = deque(self.found_parcels.copy())
-        walked_parcels = set()  # Zaten yurunen parseller
-
-        # Her parseli bir kez yuru
-        iteration = 0
-
-        while parcels_to_walk and self.is_running and iteration < self.BOUNDARY_WALK_MAX_ITERATIONS:
-            iteration += 1
-            current_batch = list(parcels_to_walk)
-            parcels_to_walk.clear()
-            new_in_iteration = 0
-
-            self.log.emit(f"  Iterasyon {iteration}: {len(current_batch)} parsel siniri taranacak")
-
-            for parcel_poly in current_batch:
-                if not self.is_running:
-                    break
-
-                # Bos veya gecersiz poligonu atla
-                if not parcel_poly or len(parcel_poly) < 3:
-                    continue
-
-                # Parsel hash'i (koordinat bazli - tuple hash ile)
-                # Siralama baslangic noktasindan bagimsizlik saglar
-                # round() kayan nokta hassasiyet farklarini onler
-                poly_hash = tuple(sorted((round(lat, 5), round(lon, 5)) for lat, lon in parcel_poly))
-                if poly_hash in walked_parcels:
-                    continue
-                walked_parcels.add(poly_hash)
-
-                # Kenar noktalari cikar
-                edge_points = self._extract_edge_points(parcel_poly, polygon)
-
-                if not edge_points:
-                    continue
+            # KML polygon siniri
+            boundary_points = self._generate_boundary_points(polygon)
+            self.log.emit(f"  KML siniri: {len(boundary_points)} nokta")
 
-                # Pruning uygula
-                edge_points = self._prune_points(edge_points)
-
-                if not edge_points:
-                    continue
-
-                # Batch sorgu - onceki/sonraki polygon sayisini karsilastir
-                polys_before = len(self.found_parcels)
-                new_parcels = self._query_and_process_points(edge_points)
-                polys_after = len(self.found_parcels)
-
-                found_count += new_parcels
-                new_in_iteration += new_parcels
-                self.boundary_walks += 1
-
-                # Yeni eklenen polygonlari kuyruga ekle (geometrisi olan parseller)
-                num_new_polys = polys_after - polys_before
-                if num_new_polys > 0:
-                    for poly in self.found_parcels[-num_new_polys:]:
-                        parcels_to_walk.append(poly)
+            phase2a = self._query_parallel(boundary_points)
+            total_found += phase2a
 
-            # Progress guncelle (FAZ 2 icin %50-75)
-            progress_pct = 50 + min(25, iteration * 5)
-            self.progress.emit(progress_pct, 100)
-
-            self.log.emit(f"  Iterasyon {iteration} bitti: {new_in_iteration} yeni parsel")
-
-            if new_in_iteration == 0:
-                break  # Yeni parsel bulunamadi, sonraki faza gec
-
-        return found_count
-
-    def _phase3_gap_fill(self, polygon: List[Tuple[float, float]]) -> int:
-        """FAZ 3: Kalan bosluklari daha yogun grid ile tara."""
-        self.current_phase = "Gap Fill"
-        found_count = 0
-
-        # Daha yogun grid adimi
-        dense_step = max(self.MIN_GAP_FILL_STEP, self.step_meters // self.GAP_FILL_STEP_DIVISOR)
-        self.log.emit(f"  Yogun grid adimi: {dense_step}m")
-
-        # Polygon bounding box
-        bbox = KMLParser.get_bounding_box(polygon)
-        center_lat = (bbox.min_lat + bbox.max_lat) / 2
-
-        # Grid noktalari olustur
-        lat_step = dense_step / 111000
-        lon_step = dense_step / (111000 * math.cos(math.radians(center_lat)))
-
-        all_points = []
-        lat = bbox.min_lat
-        while lat <= bbox.max_lat:
-            lon = bbox.min_lon
-            while lon <= bbox.max_lon:
-                if KMLParser.point_in_polygon(lat, lon, polygon):
-                    all_points.append((lat, lon))
-                lon += lon_step
-            lat += lat_step
-
-        self.log.emit(f"  Toplam {len(all_points)} nokta olusturuldu")
-
-        # Pruning - zaten bulunan parsellerin icindeki noktalari filtrele
-        points = self._prune_points(all_points)
-        self.gap_fill_points = len(points)
-        self.log.emit(f"  Pruning sonrasi {len(points)} nokta kaldi ({len(all_points) - len(points)} elendi)")
-
-        if not points:
-            return 0
-
-        # Batch'ler halinde sorgula
-        remaining = deque(points)
-        batch_num = 0
-        total_batches = (len(points) + self.BATCH_SIZE - 1) // self.BATCH_SIZE
-
-        while remaining and self.is_running:
-            batch = [remaining.popleft() for _ in range(min(self.BATCH_SIZE, len(remaining)))]
-            batch_num += 1
-
-            new_parcels = self._query_and_process_points(batch)
-            found_count += new_parcels
-
-            # Progress guncelle (FAZ 3 icin %75-100)
-            progress_pct = 75 + min(25, int((batch_num / max(total_batches, 1)) * 25))
-            self.progress.emit(progress_pct, 100)
-
-            if batch_num % 10 == 0:
-                self.log.emit(f"  Batch {batch_num}/{total_batches} - {found_count} yeni parsel")
-                self.points_remaining = len(remaining)
-                self._emit_stats()
-
-        return found_count
-
-    def _extract_edge_points(self, parcel_poly: List[Tuple[float, float]],
-                              search_polygon: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Parsel kenarlarindan disa dogru noktalar cikarir."""
-        edge_points = []
-        n = len(parcel_poly)
-
-        # Polygon kapali mi kontrol et (ilk nokta == son nokta)
-        is_closed = (n >= 2 and parcel_poly[0] == parcel_poly[-1])
-        # Kapali ise son tekrar eden noktayi atla, kapalI degilse tum kenarlari isle
-        edge_count = n - 1 if is_closed else n
-
-        for i in range(edge_count):
-            p1 = parcel_poly[i]
-            p2 = parcel_poly[(i + 1) % n]  # Son kenar icin ilk noktaya bagla
-
-            # Kenar uzunlugu (metre)
-            edge_lat = (p1[0] + p2[0]) / 2
-            lat_diff = (p2[0] - p1[0]) * 111000
-            lon_diff = (p2[1] - p1[1]) * 111000 * math.cos(math.radians(edge_lat))
-            edge_length = math.sqrt(lat_diff**2 + lon_diff**2)
-
-            if edge_length < self.MIN_EDGE_LENGTH_METERS:
-                continue
-
-            # Kenar boyunca noktalar
-            num_points = max(1, int(edge_length / self.EDGE_STEP_METERS))
-
-            for j in range(num_points + 1):
-                # num_points her zaman >= 1 (max(1, ...) ile tanimli)
-                t = j / num_points
-                mid_lat = p1[0] + t * (p2[0] - p1[0])
-                mid_lon = p1[1] + t * (p2[1] - p1[1])
-
-                # Kenardan disa dogru normal vektor hesaplama
-                # Kenar vektoru (metre): (lon_diff, lat_diff)
-                # 90 derece saat yonunde dondurulmus normal: (lat_diff, -lon_diff)
-                if edge_length > 0:
-                    # Birim normal vektor bilesenleri
-                    normal_x_unit = lat_diff / edge_length   # lon yonunde
-                    normal_y_unit = -lon_diff / edge_length  # lat yonunde
-
-                    # Kenarin her iki tarafinda da nokta olustur (ic/dis yon garantisi)
-                    for direction in [1, -1]:
-                        # Adim vektoru (metre)
-                        delta_lat_m = direction * self.OUTWARD_STEP_METERS * normal_y_unit
-                        delta_lon_m = direction * self.OUTWARD_STEP_METERS * normal_x_unit
-
-                        # Metre -> derece donusumu
-                        delta_lat_deg = delta_lat_m / 111000
-                        delta_lon_deg = delta_lon_m / (111000 * math.cos(math.radians(mid_lat)))
-
-                        new_lat = mid_lat + delta_lat_deg
-                        new_lon = mid_lon + delta_lon_deg
-
-                        # Arama polygon'u icinde VE mevcut parselin disinda olmali
-                        # (parselin icine dusen noktalar zaten pruning'de elenecekti)
-                        if (KMLParser.point_in_polygon(new_lat, new_lon, search_polygon) and
-                                not KMLParser.point_in_polygon(new_lat, new_lon, parcel_poly)):
-                            edge_points.append((new_lat, new_lon))
-
-        return edge_points
-
-    def _query_and_process_points(self, points: List[Tuple[float, float]]) -> int:
-        """Noktalari batch olarak sorgular ve sonuclari isler."""
-        new_count = 0
-        remaining = deque(points)
-
-        while remaining and self.is_running:
-            batch = [remaining.popleft() for _ in range(min(self.BATCH_SIZE, len(remaining)))]
-
-            results, error = self._query_batch(batch)
-
-            if error == 401:
-                self.auth_error.emit()
-                self.is_running = False
-                return new_count
-
-            if error or not results:
-                continue
-
-            for i, result in enumerate(results):
-                if result and 'properties' in result:
-                    _, is_new = self._process_found_parcel(result, batch[i])
-                    if is_new:
-                        new_count += 1
-
-        return new_count
-
-    def _cell_intersects_polygon(self, cell: QuadTreeNode, polygon: List[Tuple[float, float]]) -> bool:
-        """Hucrenin polygon ile kesisip kesismedigini kontrol eder."""
-        # Hucrenin herhangi bir kosesi polygon icindeyse veya
-        # Polygon'un herhangi bir kosesi hucre icindeyse kesisiyor demektir
-        corners = cell.get_corners()
-        for lat, lon in corners:
-            if KMLParser.point_in_polygon(lat, lon, polygon):
-                return True
-
-        # Hucre merkezi polygon icinde mi?
-        center = cell.get_center()
-        if KMLParser.point_in_polygon(center[0], center[1], polygon):
-            return True
-
-        return False
-
-    def _scan_cell(self, cell: QuadTreeNode, polygon: List[Tuple[float, float]]) -> Tuple[bool, int]:
-        """
-        Bir hucreyi tarar.
-        Returns: (should_subdivide, new_parcel_count)
-        """
-        cell_size = cell.get_cell_size_meters()
-
-        # Kucuk hucreler icin grid tarama yap
-        if cell_size <= self.step_meters * 2:
-            return self._grid_scan_cell(cell, polygon)
-
-        # Buyuk hucreler icin sample noktalari sorgula
-        sample_points = cell.get_sample_points()
-        # Sadece polygon icindeki noktalari filtrele
-        valid_points = [(lat, lon) for lat, lon in sample_points
-                        if KMLParser.point_in_polygon(lat, lon, polygon)]
-
-        if not valid_points:
-            return False, 0
-
-        # Zaten bulunan parsellerin icindeki noktalari filtrele (pruning)
-        valid_points = self._prune_points(valid_points)
-
-        if not valid_points:
-            return False, 0
-
-        # Batch sorgu
-        results, error = self._query_batch(valid_points)
-
-        if error == 401:
-            self.auth_error.emit()
-            self.is_running = False
-            return False, 0
-
-        if error or not results:
-            return True, 0  # Hata durumunda subdivide et
-
-        # Sonuclari isle
-        new_count = 0
-        unique_parcels = set()
-
-        for i, result in enumerate(results):
-            if result and 'properties' in result:
-                parsel_id, is_new = self._process_found_parcel(result, valid_points[i])
-                if is_new:
-                    new_count += 1
-                unique_parcels.add(parsel_id)
-
-        # Karar ver: subdivide etmeli mi?
-        # - Farkli parseller bulduysa -> subdivide (sinir bolgesi)
-        # - Sadece 1 parsel ve hepsi ayni -> subdivide etme
-        # - Hic parsel yok -> subdivide etme (bos alan)
-        should_subdivide = len(unique_parcels) > 1 or (len(unique_parcels) == 1 and new_count > 0)
-
-        return should_subdivide, new_count
-
-    def _grid_scan_cell(self, cell: QuadTreeNode, polygon: List[Tuple[float, float]]) -> Tuple[bool, int]:
-        """Kucuk hucreler icin yogun grid tarama."""
-        points = self._generate_grid_for_cell(cell, polygon)
-        points = self._prune_points(points)
-
-        if not points:
-            return False, 0
-
-        new_count = 0
-
-        # Noktalari batch'ler halinde isle
-        remaining = deque(points)
-        while remaining and self.is_running:
-            batch = [remaining.popleft() for _ in range(min(self.BATCH_SIZE, len(remaining)))]
-
-            results, error = self._query_batch(batch)
-
-            if error == 401:
-                self.auth_error.emit()
-                self.is_running = False
-                return False, new_count
-
-            if error or not results:
-                continue
-
-            for i, result in enumerate(results):
-                if result and 'properties' in result:
-                    _, is_new = self._process_found_parcel(result, batch[i])
-                    if is_new:
-                        new_count += 1
-
-        return False, new_count
-
-    def _generate_grid_for_cell(self, cell: QuadTreeNode,
-                                  polygon: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Hucre icin grid noktalari olusturur."""
-        center_lat = (cell.min_lat + cell.max_lat) / 2
-        lat_step = self.step_meters / 111000
-        lon_step = self.step_meters / (111000 * math.cos(math.radians(center_lat)))
-
-        points = []
-        lat = cell.min_lat
-        while lat <= cell.max_lat:
-            lon = cell.min_lon
-            while lon <= cell.max_lon:
-                if KMLParser.point_in_polygon(lat, lon, polygon):
-                    points.append((lat, lon))
-                lon += lon_step
-            lat += lat_step
-        return points
-
-    def _prune_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Zaten bulunan parsellerin icindeki noktalari filtreler."""
-        if not self.found_parcels:
-            return points
-
-        return [p for p in points
-                if not any(KMLParser.point_in_polygon(p[0], p[1], poly) for poly in self.found_parcels)]
-
-    def _query_batch(self, points: List[Tuple[float, float]]) -> Tuple[list, any]:
-        """Batch sorgu yapar ve hatalari yonetir."""
-        self.api_calls += 1
-        self.total_points_queried += len(points)
-        max_retries = 2
-
-        for attempt in range(max_retries + 1):
-            results, error = self.client.get_batch(points)
-
-            if error == 401:
-                return None, 401
-
-            if not error:
-                # Null/bos sonuclari say
-                if results:
-                    for r in results:
-                        if r is None or (isinstance(r, dict) and 'properties' not in r):
-                            self.null_responses += 1
-                return results, None
-
-            if attempt < max_retries:
-                self.log.emit(f"  Batch hatasi, tekrar deneniyor ({attempt + 1}/{max_retries})...")
-                time.sleep(self.delay * 2)
-
-        # Tum batch sorgulanamadi (ag hatasi vs)
-        self.failed_points += len(points)
-        return None, error
-
-    def _log_summary(self, found_count: int):
-        """Tarama ozeti loglar."""
+            # Bulunan parsellerin sinirlari (flood fill)
+            if self.found_parcels:
+                walked = set()
+                parcels_to_walk = list(self.found_parcels)
+                iteration = 0
+
+                while parcels_to_walk and self.is_running and iteration < 5:
+                    iteration += 1
+                    current = parcels_to_walk
+                    parcels_to_walk = []
+
+                    all_edge_points = []
+                    for parcel_poly in current:
+                        if not parcel_poly or len(parcel_poly) < 3:
+                            continue
+
+                        poly_hash = tuple(sorted((round(p[0], 5), round(p[1], 5)) for p in parcel_poly))
+                        if poly_hash in walked:
+                            continue
+                        walked.add(poly_hash)
+
+                        edge_pts = self._extract_parcel_edge_points(parcel_poly, polygon)
+                        all_edge_points.extend(edge_pts)
+
+                    if not all_edge_points:
+                        break
+
+                    before = len(self.found_parcels)
+                    new_found = self._query_parallel(all_edge_points)
+                    total_found += new_found
+                    after = len(self.found_parcels)
+
+                    # Yeni parselleri kuyruga ekle
+                    if after > before:
+                        parcels_to_walk.extend(self.found_parcels[before:after])
+
+                    self.log.emit(f"  Iterasyon {iteration}: {new_found} yeni parsel")
+
+                    if new_found == 0:
+                        break
+
+            phase2 = total_found - phase1
+            self.log.emit(f"[FAZ 2] Tamamlandi: {phase2} parsel")
+            self.progress.emit(60, 100)
+
+            if not self.is_running:
+                break
+
+            # === FAZ 3: YOGUN GRID (sadece bosluklarda) ===
+            self.current_phase = "Yogun Grid"
+            self.log.emit(f"\n[FAZ 3] Yogun grid ({self.dense_step}m)...")
+
+            dense_points = self._generate_grid(polygon, self.dense_step)
+            self.log.emit(f"  {len(dense_points)} nokta olusturuldu")
+
+            # Pruning + duplicate filtre
+            pruned = self._prune_points(dense_points)
+            self.log.emit(f"  Pruning: {len(pruned)} nokta kaldi ({len(dense_points) - len(pruned)} elendi)")
+
+            phase3 = self._query_parallel(pruned)
+            total_found += phase3
+            self.log.emit(f"[FAZ 3] Tamamlandi: {phase3} parsel")
+            self.progress.emit(100, 100)
+
+        # Ozet
         self.log.emit(f"\n{'='*50}")
         self.log.emit("TARAMA OZETI")
-        self.log.emit("="*50)
-        self.log.emit(f"Toplam parsel: {found_count}")
+        self.log.emit("=" * 50)
+        self.log.emit(f"Toplam parsel: {total_found}")
         self.log.emit(f"API cagrilari: {self.api_calls} batch ({self.total_points_queried} nokta)")
-        self.log.emit(f"Parsel bulunamadi: {self.null_responses} nokta")
+        self.log.emit(f"Tekrar sorgu engellendi: {self.duplicate_skipped}")
+        self.log.emit(f"Bos yanit: {self.null_responses}")
         if self.failed_points > 0:
-            self.log.emit(f"Sorgu hatasi (ag vs): {self.failed_points} nokta")
-        self.log.emit(f"Quadtree hucreleri: {self.cells_processed} islendi, {self.cells_skipped} atlandi")
-        self.log.emit(f"Sinir takibi: {self.boundary_walks} parsel siniri tarandi")
-        self.log.emit(f"Bosluk doldurma: {self.gap_fill_points} nokta tarandi")
-        self.log.emit("Hibrit algoritma (Quadtree + Boundary + Gap Fill) tamamlandi")
+            self.log.emit(f"Hata: {self.failed_points} nokta")
+
+        self.finished_scan.emit(total_found)
 
     def stop(self):
-        """Taramayi durdurur."""
+        """Taramayi durdur."""
         self.is_running = False
 
 
@@ -921,30 +785,36 @@ class MainWindow(QMainWindow):
         kml_layout.addWidget(self.kml_info)
         layout.addWidget(kml_card)
 
-        # Ayarlar Card
-        settings_card = CardWidget()
-        settings_layout = QHBoxLayout(settings_card)
+        # Tarama Kalitesi Card
+        quality_card = CardWidget()
+        quality_layout = QVBoxLayout(quality_card)
+        quality_layout.addWidget(SubtitleLabel("Tarama Kalitesi"))
 
-        # Grid araligi
-        grid_layout = QVBoxLayout()
-        grid_layout.addWidget(BodyLabel("Grid Araligi (metre)"))
-        self.step_spin = SpinBox()
-        self.step_spin.setRange(10, 200)
-        self.step_spin.setValue(30)
-        grid_layout.addWidget(self.step_spin)
-        settings_layout.addLayout(grid_layout)
+        # Radio butonlar
+        radio_layout = QHBoxLayout()
 
-        # Retry bekleme (sadece hata durumunda)
-        delay_layout = QVBoxLayout()
-        delay_layout.addWidget(BodyLabel("Retry Bekleme (sn)"))
-        self.delay_spin = DoubleSpinBox()
-        self.delay_spin.setRange(0.1, 5.0)
-        self.delay_spin.setValue(0.5)
-        self.delay_spin.setSingleStep(0.1)
-        delay_layout.addWidget(self.delay_spin)
-        settings_layout.addLayout(delay_layout)
+        self.quality_group = QButtonGroup(self)
 
-        layout.addWidget(settings_card)
+        self.radio_fast = RadioButton("Hizli")
+        self.radio_fast.setToolTip("Buyuk alanlar icin (100m → 40m grid)")
+        self.quality_group.addButton(self.radio_fast, 0)
+        radio_layout.addWidget(self.radio_fast)
+
+        self.radio_balanced = RadioButton("Dengeli (Onerilen)")
+        self.radio_balanced.setToolTip("Cogu durum icin ideal (60m → 20m grid)")
+        self.radio_balanced.setChecked(True)
+        self.quality_group.addButton(self.radio_balanced, 1)
+        radio_layout.addWidget(self.radio_balanced)
+
+        self.radio_detailed = RadioButton("Detayli")
+        self.radio_detailed.setToolTip("Kucuk parseller icin (40m → 10m grid)")
+        self.quality_group.addButton(self.radio_detailed, 2)
+        radio_layout.addWidget(self.radio_detailed)
+
+        radio_layout.addStretch()
+        quality_layout.addLayout(radio_layout)
+
+        layout.addWidget(quality_card)
 
         # Butonlar
         btn_layout = QHBoxLayout()
@@ -1017,18 +887,20 @@ class MainWindow(QMainWindow):
         if api_key:
             self.api_key_input.setText(api_key)
 
-        step = self.settings.value("step_meters", 30, type=int)
-        self.step_spin.setValue(step)
-
-        delay = self.settings.value("delay", 0.3, type=float)
-        self.delay_spin.setValue(delay)
+        # Kalite ayari
+        quality = self.settings.value("quality", 1, type=int)
+        if quality == 0:
+            self.radio_fast.setChecked(True)
+        elif quality == 2:
+            self.radio_detailed.setChecked(True)
+        else:
+            self.radio_balanced.setChecked(True)
 
     def save_settings(self):
         """Mevcut ayarlari kaydeder."""
         self.settings.setValue("worker_url", self.worker_url_input.text())
         self.settings.setValue("api_key", self.api_key_input.text())
-        self.settings.setValue("step_meters", self.step_spin.value())
-        self.settings.setValue("delay", self.delay_spin.value())
+        self.settings.setValue("quality", self.quality_group.checkedId())
 
     def log(self, message: str):
         """Log alanina zaman damgali mesaj ekler ve dosyaya yazar."""
@@ -1047,23 +919,31 @@ class MainWindow(QMainWindow):
             self.kml_path_input.setText(path)
             self.load_kml(path)
 
+    def _get_selected_quality(self) -> ScanQuality:
+        """Secili kalite seviyesini dondurur."""
+        quality_id = self.quality_group.checkedId()
+        if quality_id == 0:
+            return ScanQuality.FAST
+        elif quality_id == 2:
+            return ScanQuality.DETAILED
+        return ScanQuality.BALANCED
+
     def load_kml(self, path: str):
         """KML dosyasini yukler ve parse eder."""
         try:
             self.polygons = KMLParser.parse(path)
             info = f"{len(self.polygons)} polygon bulundu"
 
-            total_points = 0
+            # Tahmini alan hesapla (dengeli kalite icin)
+            total_area_km2 = 0
             for poly in self.polygons:
                 bbox = KMLParser.get_bounding_box(poly)
                 center_lat = (bbox.min_lat + bbox.max_lat) / 2
-                lat_step = self.step_spin.value() / 111000
-                lon_step = self.step_spin.value() / (111000 * math.cos(math.radians(center_lat)))
-                lat_count = int((bbox.max_lat - bbox.min_lat) / lat_step) + 1
-                lon_count = int((bbox.max_lon - bbox.min_lon) / lon_step) + 1
-                total_points += lat_count * lon_count
+                width_km = (bbox.max_lon - bbox.min_lon) * 111 * math.cos(math.radians(center_lat))
+                height_km = (bbox.max_lat - bbox.min_lat) * 111
+                total_area_km2 += width_km * height_km
 
-            info += f" (~{total_points} tarama noktasi)"
+            info += f" (~{total_area_km2:.2f} km²)"
             self.kml_info.setText(info)
             self.log(f"KML yuklendi: {path}")
             self.log(info)
@@ -1122,21 +1002,20 @@ class MainWindow(QMainWindow):
                 duration=3000
             )
 
-        self._start_worker(self.step_spin.value(), reuse_parcels=False)
+        self._start_worker(reuse_parcels=False)
         self.log("Tarama baslatildi...")
 
-    def _start_worker(self, step_meters: int, reuse_parcels: bool = False):
-        """Worker olusturur ve baslatir (ortak mantik)."""
+    def _start_worker(self, reuse_parcels: bool = False, quality: ScanQuality = None):
+        """Worker olusturur ve baslatir."""
         url = self.worker_url_input.text().strip()
         api_key = self.api_key_input.text().strip() or None
         client = TKGMClient(url, api_key)
 
-        self.worker = ScanWorker(
-            client,
-            self.polygons,
-            step_meters,
-            self.delay_spin.value()
-        )
+        # Kalite secimi
+        if quality is None:
+            quality = self._get_selected_quality()
+
+        self.worker = ScanWorker(client, self.polygons, quality)
 
         # Eger onceki parselleri koruyacaksak, worker'a aktar
         if reuse_parcels and self.parcels:
@@ -1178,12 +1057,20 @@ class MainWindow(QMainWindow):
         phase = stats.get("phase", "")
         queried = stats.get("queried", 0)
         remaining = stats.get("remaining", 0)
+        skipped = stats.get("skipped", 0)
         null_resp = stats.get("null_responses", 0)
         failed = stats.get("failed_points", 0)
-        failed_str = f" | Hata: {failed}" if failed > 0 else ""
-        self.stats_label.setText(
-            f"Faz: {phase} | Sorgulanan: {queried} | Kalan: {remaining} | Bos: {null_resp}{failed_str}"
-        )
+
+        parts = [f"Faz: {phase}", f"Sorgulanan: {queried}"]
+        if remaining > 0:
+            parts.append(f"Kalan: {remaining}")
+        if skipped > 0:
+            parts.append(f"Atlanan: {skipped}")
+        parts.append(f"Bos: {null_resp}")
+        if failed > 0:
+            parts.append(f"Hata: {failed}")
+
+        self.stats_label.setText(" | ".join(parts))
 
     def on_parcel_found(self, parsel_id: str, data: dict):
         """Bulunan parseli kaydeder."""
@@ -1221,7 +1108,7 @@ class MainWindow(QMainWindow):
         )
 
     def refine_scan(self):
-        """Eksik bolgeleri daha yogun grid ile tekrar tarar."""
+        """Eksik bolgeleri Detayli kalite ile tekrar tarar."""
         if not self.polygons:
             InfoBar.warning(
                 title="Uyari",
@@ -1236,17 +1123,10 @@ class MainWindow(QMainWindow):
         if not url:
             return
 
-        # Daha yogun grid (mevcut step'in 1/3'u)
-        refined_step = max(
-            ScanWorker.MIN_REFINE_STEP,
-            self.step_spin.value() // ScanWorker.REFINE_STEP_DIVISOR
-        )
-
         self.log("\n=== DETAYLANDIRMA TARAMASI ===")
-        self.log(f"Yogun grid adimi: {refined_step}m (onceki: {self.step_spin.value()}m)")
+        self.log(f"Detayli kalite ile yeniden taranacak ({len(self.parcels)} mevcut parsel korunuyor)")
 
-        self._start_worker(refined_step, reuse_parcels=True)
-        self.log(f"Detaylandirma baslatildi ({len(self.parcels)} mevcut parsel korunuyor)...")
+        self._start_worker(reuse_parcels=True, quality=ScanQuality.DETAILED)
 
     def save_results(self):
         """Sonuclari dosyaya kaydetme dialogunu acar."""

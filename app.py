@@ -316,9 +316,9 @@ class ScanWorker(QThread):
 
             # Geometriyi kaydet (pruning icin) - en az 3 nokta olmali
             if 'geometry' in result and result['geometry'].get('type') == 'Polygon':
-                coords = result['geometry'].get('coordinates', [[]])[0]
-                if len(coords) >= 3:
-                    self.found_parcels.append(self.geojson_coords_to_poly(coords))
+                coord_list = result['geometry'].get('coordinates') or []
+                if coord_list and len(coord_list[0]) >= 3:
+                    self.found_parcels.append(self.geojson_coords_to_poly(coord_list[0]))
 
         return parsel_id, is_new
 
@@ -576,10 +576,16 @@ class ScanWorker(QThread):
                               search_polygon: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         """Parsel kenarlarindan disa dogru noktalar cikarir."""
         edge_points = []
+        n = len(parcel_poly)
 
-        for i in range(len(parcel_poly) - 1):
+        # Polygon kapali mi kontrol et (ilk nokta == son nokta)
+        is_closed = (n >= 2 and parcel_poly[0] == parcel_poly[-1])
+        # Kapali ise son tekrar eden noktayi atla, kapalI degilse tum kenarlari isle
+        edge_count = n - 1 if is_closed else n
+
+        for i in range(edge_count):
             p1 = parcel_poly[i]
-            p2 = parcel_poly[i + 1]
+            p2 = parcel_poly[(i + 1) % n]  # Son kenar icin ilk noktaya bagla
 
             # Kenar uzunlugu (metre)
             edge_lat = (p1[0] + p2[0]) / 2
@@ -1148,9 +1154,9 @@ class MainWindow(QMainWindow):
             for parsel_id, data in self.parcels.items():
                 self.worker.found_ids.add(parsel_id)
                 if 'geometry' in data and data['geometry'].get('type') == 'Polygon':
-                    coords = data['geometry'].get('coordinates', [[]])[0]
-                    if len(coords) >= 3:  # En az 3 nokta olmali
-                        self.worker.found_parcels.append(ScanWorker.geojson_coords_to_poly(coords))
+                    coord_list = data['geometry'].get('coordinates') or []
+                    if coord_list and len(coord_list[0]) >= 3:
+                        self.worker.found_parcels.append(ScanWorker.geojson_coords_to_poly(coord_list[0]))
 
         # Sinyalleri bagla
         self.worker.progress.connect(self.on_progress)

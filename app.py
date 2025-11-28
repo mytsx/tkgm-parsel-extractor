@@ -275,7 +275,8 @@ class ScanWorker(QThread):
         self.total_points_queried = 0
         self.points_remaining = 0
         self.current_phase = ""
-        self.null_responses = 0  # API'den null/bos donen sorgular
+        self.null_responses = 0  # API'den parsel bulunamadi yaniti
+        self.failed_points = 0   # Ag hatasi nedeniyle sorgulanamayan noktalar
 
     def _emit_stats(self):
         """Guncel istatistikleri UI'a gonderir."""
@@ -285,7 +286,8 @@ class ScanWorker(QThread):
             "api_calls": self.api_calls,
             "queried": self.total_points_queried,
             "remaining": self.points_remaining,
-            "null_responses": self.null_responses
+            "null_responses": self.null_responses,
+            "failed_points": self.failed_points
         })
 
     def run(self):
@@ -410,8 +412,9 @@ class ScanWorker(QThread):
                 if not self.is_running:
                     break
 
-                # Parsel hash'i (ilk koordinat)
-                poly_hash = f"{parcel_poly[0][0]:.6f}_{parcel_poly[0][1]:.6f}"
+                # Parsel hash'i (ilk 3 koordinat - daha guvenilir)
+                hash_coords = parcel_poly[:3] if len(parcel_poly) >= 3 else parcel_poly
+                poly_hash = "_".join(f"{c[0]:.5f},{c[1]:.5f}" for c in hash_coords)
                 if poly_hash in walked_parcels:
                     continue
                 walked_parcels.add(poly_hash)
@@ -781,8 +784,8 @@ class ScanWorker(QThread):
                 self.log.emit(f"  Batch hatasi, tekrar deneniyor ({attempt + 1}/{max_retries})...")
                 time.sleep(self.delay * 2)
 
-        # Tum batch bos dondu
-        self.null_responses += len(points)
+        # Tum batch sorgulanamadi (ag hatasi vs)
+        self.failed_points += len(points)
         return None, error
 
     def _log_summary(self, found_count: int):
@@ -792,7 +795,9 @@ class ScanWorker(QThread):
         self.log.emit("="*50)
         self.log.emit(f"Toplam parsel: {found_count}")
         self.log.emit(f"API cagrilari: {self.api_calls} batch ({self.total_points_queried} nokta)")
-        self.log.emit(f"Bos/null yanit: {self.null_responses} nokta")
+        self.log.emit(f"Parsel bulunamadi: {self.null_responses} nokta")
+        if self.failed_points > 0:
+            self.log.emit(f"Sorgu hatasi (ag vs): {self.failed_points} nokta")
         self.log.emit(f"Quadtree hucreleri: {self.cells_processed} islendi, {self.cells_skipped} atlandi")
         self.log.emit(f"Sinir takibi: {self.boundary_walks} parsel siniri tarandi")
         self.log.emit(f"Bosluk doldurma: {self.gap_fill_points} nokta tarandi")
@@ -1082,14 +1087,10 @@ class MainWindow(QMainWindow):
             return
 
         self.save_settings()
-        self.parcels = {}
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-
-        api_key = self.api_key_input.text().strip() or None
-        client = TKGMClient(url, api_key)
+        self.parcels = {}  # Yeni tarama, onceki parselleri temizle
 
         # API Key uyarisi
+        api_key = self.api_key_input.text().strip()
         if not api_key:
             InfoBar.info(
                 title="Bilgi",
@@ -1099,12 +1100,32 @@ class MainWindow(QMainWindow):
                 duration=3000
             )
 
+        self._start_worker(self.step_spin.value(), reuse_parcels=False)
+        self.log("Tarama baslatildi...")
+
+    def _start_worker(self, step_meters: int, reuse_parcels: bool = False):
+        """Worker olusturur ve baslatir (ortak mantik)."""
+        url = self.worker_url_input.text().strip()
+        api_key = self.api_key_input.text().strip() or None
+        client = TKGMClient(url, api_key)
+
         self.worker = ScanWorker(
             client,
             self.polygons,
-            self.step_spin.value(),
+            step_meters,
             self.delay_spin.value()
         )
+
+        # Eger onceki parselleri koruyacaksak, worker'a aktar
+        if reuse_parcels and self.parcels:
+            for parsel_id, data in self.parcels.items():
+                self.worker.found_ids.add(parsel_id)
+                if 'geometry' in data and data['geometry'].get('type') == 'Polygon':
+                    coords = data['geometry'].get('coordinates', [[]])[0]
+                    parcel_poly = [(c[1], c[0]) for c in coords]
+                    self.worker.found_parcels.append(parcel_poly)
+
+        # Sinyalleri bagla
         self.worker.progress.connect(self.on_progress)
         self.worker.stats_update.connect(self.on_stats_update)
         self.worker.log.connect(self.log)
@@ -1112,9 +1133,11 @@ class MainWindow(QMainWindow):
         self.worker.finished_scan.connect(self.on_finished)
         self.worker.auth_error.connect(self.on_auth_error)
         self.worker.start()
-        self.refine_btn.setEnabled(False)
 
-        self.log("Tarama baslatildi...")
+        # Buton durumlarini guncelle
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.refine_btn.setEnabled(False)
 
     def stop_scan(self):
         """Devam eden taramayi durdurur."""
@@ -1134,8 +1157,10 @@ class MainWindow(QMainWindow):
         queried = stats.get("queried", 0)
         remaining = stats.get("remaining", 0)
         null_resp = stats.get("null_responses", 0)
+        failed = stats.get("failed_points", 0)
+        failed_str = f" | Hata: {failed}" if failed > 0 else ""
         self.stats_label.setText(
-            f"Faz: {phase} | Sorgulanan: {queried} | Kalan: {remaining} | Bos yanit: {null_resp}"
+            f"Faz: {phase} | Sorgulanan: {queried} | Kalan: {remaining} | Bos: {null_resp}{failed_str}"
         )
 
     def on_parcel_found(self, parsel_id: str, data: dict):
@@ -1195,37 +1220,7 @@ class MainWindow(QMainWindow):
         self.log("\n=== DETAYLANDIRMA TARAMASI ===")
         self.log(f"Yogun grid adimi: {refined_step}m (onceki: {self.step_spin.value()}m)")
 
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.refine_btn.setEnabled(False)
-
-        api_key = self.api_key_input.text().strip() or None
-        client = TKGMClient(url, api_key)
-
-        # Yeni worker olustur - mevcut bulunan parselleri aktar
-        self.worker = ScanWorker(
-            client,
-            self.polygons,
-            refined_step,
-            self.delay_spin.value()
-        )
-
-        # Onceki taramadan bulunan parselleri aktar (pruning icin)
-        for parsel_id, data in self.parcels.items():
-            self.worker.found_ids.add(parsel_id)
-            if 'geometry' in data and data['geometry'].get('type') == 'Polygon':
-                coords = data['geometry'].get('coordinates', [[]])[0]
-                parcel_poly = [(c[1], c[0]) for c in coords]
-                self.worker.found_parcels.append(parcel_poly)
-
-        self.worker.progress.connect(self.on_progress)
-        self.worker.stats_update.connect(self.on_stats_update)
-        self.worker.log.connect(self.log)
-        self.worker.parcel_found.connect(self.on_parcel_found)
-        self.worker.finished_scan.connect(self.on_finished)
-        self.worker.auth_error.connect(self.on_auth_error)
-        self.worker.start()
-
+        self._start_worker(refined_step, reuse_parcels=True)
         self.log(f"Detaylandirma baslatildi ({len(self.parcels)} mevcut parsel korunuyor)...")
 
     def save_results(self):

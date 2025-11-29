@@ -1,23 +1,34 @@
 {
+  "version": "2.0",
   "workers": [
-    {
-      "name": "tkgm-parsel-proxy",
-      "url": "https://tkgm-parsel-proxy.mehmet49946.workers.dev",
-      "description": "TKGM Proxy API - Parsel ve İdari Yapı sorguları",
-      "version": "2.0",
-      "endpoints": {
-        "idariYapi": [
-          "/iller",
-          "/ilceler/{ilId}",
-          "/mahalleler/{ilceId}",
-          "/parsel-by-ada/{mahalleId}/{ada}/{parsel}"
-        ],
-        "parselSorgu": [
-          "/parsel/{lat}/{lon}",
-          "/batch"
-        ]
-      },
-      "apiKey": null
-    }
-  ]
+    "https://tkgm-proxy-1.example.workers.dev",
+    "https://tkgm-proxy-2.example.workers.dev",
+    "https://tkgm-proxy-3.example.workers.dev",
+    "https://tkgm-proxy-4.example.workers.dev",
+    "https://tkgm-proxy-5.example.workers.dev",
+    "https://tkgm-proxy-6.example.workers.dev",
+    "https://tkgm-proxy-7.example.workers.dev",
+    "https://tkgm-proxy-8.example.workers.dev",
+    "https://tkgm-proxy-9.example.workers.dev",
+    "https://tkgm-proxy-10.example.workers.dev",
+    "https://tkgm-proxy-11.example.workers.dev",
+    "https://tkgm-proxy-12.example.workers.dev"
+  ],
+  "endpoints": {
+    "idariYapi": [
+      "/iller",
+      "/ilceler/{ilId}",
+      "/mahalleler/{ilceId}",
+      "/parsel-by-ada/{mahalleId}/{ada}/{parsel}"
+    ],
+    "parselSorgu": [
+      "/parsel/{lat}/{lon}",
+      "/batch"
+    ]
+  },
+  "auth": {
+    "header": "X-API-Key",
+    "required": true,
+    "apiKey": "YOUR_API_KEY_HERE"
+  }
 }

@@ -6,7 +6,7 @@ TKGM (Tapu ve Kadastro Genel Müdürlüğü) API Proxy - Cloudflare Workers
 ![Version](https://img.shields.io/badge/Version-2.0-blue)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mytsx/tkgm-parsel-extractor)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mytsx/tkgm-worker)
 
 ## Özellikler
 

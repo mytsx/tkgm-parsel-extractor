@@ -1,0 +1,23 @@
+{
+  "workers": [
+    {
+      "name": "tkgm-parsel-proxy",
+      "url": "https://tkgm-parsel-proxy.mehmet49946.workers.dev",
+      "description": "TKGM Proxy API - Parsel ve İdari Yapı sorguları",
+      "version": "2.0",
+      "endpoints": {
+        "idariYapi": [
+          "/iller",
+          "/ilceler/{ilId}",
+          "/mahalleler/{ilceId}",
+          "/parsel-by-ada/{mahalleId}/{ada}/{parsel}"
+        ],
+        "parselSorgu": [
+          "/parsel/{lat}/{lon}",
+          "/batch"
+        ]
+      },
+      "apiKey": null
+    }
+  ]
+}

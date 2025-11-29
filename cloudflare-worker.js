@@ -1,157 +1,165 @@
 // Cloudflare Worker - TKGM API Proxy
 // Bu worker'ı Cloudflare Dashboard'da deploy edin
 
-// Batch endpoint sabitleri
+// Sabitler
 const MAX_BATCH_COORDS = 20;      // Maksimum koordinat sayisi
 const STAGGER_START_INDEX = 5;    // Bu indexten sonra gecikme baslar
 const STAGGER_DELAY_MS = 50;      // Her istek arasi gecikme (ms)
+
+// TKGM API Base URL'leri
+const TKGM_API_V3 = "https://cbsapi.tkgm.gov.tr/megsiswebapi.v3/api";
+const TKGM_API_V31 = "https://cbsapi.tkgm.gov.tr/megsiswebapi.v3.1/api";
+
+// Ortak header'lar
+const TKGM_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  "Accept": "application/json",
+  "Referer": "https://parselsorgu.tkgm.gov.tr/",
+  "Origin": "https://parselsorgu.tkgm.gov.tr"
+};
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
+};
+
+// Yardımcı fonksiyon - TKGM'ye istek at
+async function fetchTKGM(url) {
+  return fetch(url, { headers: TKGM_HEADERS });
+}
+
+// JSON yanıt oluştur
+function jsonResponse(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...extraHeaders }
+  });
+}
 
 export default {
   async fetch(request, env, ctx) {
     // CORS preflight
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
-        },
-      });
+      return new Response(null, { headers: CORS_HEADERS });
     }
 
     // Opsiyonel API Key kontrolu
-    // Cloudflare Dashboard > Worker > Settings > Variables > API_KEY ekleyin
     if (env.API_KEY) {
       const providedKey = request.headers.get("X-API-Key");
       if (providedKey !== env.API_KEY) {
-        return new Response(JSON.stringify({ error: "Unauthorized - Invalid API Key" }), {
-          status: 401,
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
-          }
-        });
+        return jsonResponse({ error: "Unauthorized - Invalid API Key" }, 401);
       }
     }
 
     const url = new URL(request.url);
+    const path = url.pathname;
 
-    // /parsel/lat/lon endpoint'i
-    if (url.pathname.startsWith("/parsel/")) {
-      const parts = url.pathname.split("/");
-      const lat = parts[2];
-      const lon = parts[3];
+    try {
+      // ============================================
+      // İDARİ YAPI ENDPOINTLERİ
+      // ============================================
 
-      if (!lat || !lon) {
-        return new Response(JSON.stringify({ error: "lat ve lon parametreleri gerekli" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" }
-        });
+      // GET /iller - Tüm illerin listesi
+      if (path === "/iller" || path === "/iller/") {
+        const response = await fetchTKGM(`${TKGM_API_V3}/idariYapi/ilListe`);
+        const data = await response.json();
+        return jsonResponse(data, response.status);
       }
 
-      const tkgmUrl = `https://cbsapi.tkgm.gov.tr/megsiswebapi.v3.1/api/parsel/${lat}/${lon}/`;
+      // GET /ilceler/{ilId} - Belirli ilin ilçeleri
+      const ilceMatch = path.match(/^\/ilceler\/(\d+)\/?$/);
+      if (ilceMatch) {
+        const ilId = ilceMatch[1];
+        const response = await fetchTKGM(`${TKGM_API_V3}/idariYapi/ilceListe/${ilId}`);
+        const data = await response.json();
+        return jsonResponse(data, response.status);
+      }
 
-      try {
-        const response = await fetch(tkgmUrl, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://parselsorgu.tkgm.gov.tr/",
-            "Origin": "https://parselsorgu.tkgm.gov.tr"
-          }
-        });
+      // GET /mahalleler/{ilceId} - Belirli ilçenin mahalleleri
+      const mahalleMatch = path.match(/^\/mahalleler\/(\d+)\/?$/);
+      if (mahalleMatch) {
+        const ilceId = mahalleMatch[1];
+        const response = await fetchTKGM(`${TKGM_API_V3}/idariYapi/mahalleListe/${ilceId}`);
+        const data = await response.json();
+        return jsonResponse(data, response.status);
+      }
 
+      // GET /parsel-by-ada/{mahalleId}/{ada}/{parsel} - Ada/Parsel ile sorgu
+      const adaParselMatch = path.match(/^\/parsel-by-ada\/(\d+)\/(\d+)\/(\d+)\/?$/);
+      if (adaParselMatch) {
+        const [, mahalleId, ada, parsel] = adaParselMatch;
+        const response = await fetchTKGM(`${TKGM_API_V31}/parsel/${mahalleId}/${ada}/${parsel}`);
+        const data = await response.json();
+        return jsonResponse(data, response.status);
+      }
+
+      // ============================================
+      // KOORDİNAT İLE PARSEL SORGULAMA
+      // ============================================
+
+      // GET /parsel/{lat}/{lon} - Koordinat ile parsel sorgu
+      if (path.startsWith("/parsel/")) {
+        const parts = path.split("/");
+        const lat = parts[2];
+        const lon = parts[3];
+
+        if (!lat || !lon) {
+          return jsonResponse({ error: "lat ve lon parametreleri gerekli" }, 400);
+        }
+
+        const response = await fetchTKGM(`${TKGM_API_V31}/parsel/${lat}/${lon}/`);
         const data = await response.text();
 
         return new Response(data, {
           status: response.status,
           headers: {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
+            ...CORS_HEADERS,
             "X-Proxied-By": "cloudflare-worker"
           }
         });
-      } catch (error) {
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" }
-        });
       }
-    }
 
-    // /batch endpoint'i - toplu sorgu (optimize edilmis)
-    if (url.pathname === "/batch" && request.method === "POST") {
-      try {
+      // ============================================
+      // BATCH ENDPOINT
+      // ============================================
+
+      // POST /batch - Toplu koordinat sorgusu
+      if (path === "/batch" && request.method === "POST") {
         const body = await request.json();
-        const coordinates = body.coordinates; // [{lat, lon}, ...]
+        const coordinates = body.coordinates;
 
         if (!coordinates || !Array.isArray(coordinates)) {
-          return new Response(JSON.stringify({ error: "coordinates array gerekli" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" }
-          });
+          return jsonResponse({ error: "coordinates array gerekli" }, 400);
         }
 
-        // Koordinat limitini uygula
         const limitedCoords = coordinates.slice(0, MAX_BATCH_COORDS);
 
         const results = await Promise.all(
           limitedCoords.map(async (coord, index) => {
-            // Staggered delay: ilk 6 istek (0-5) aninda, sonrakiler STAGGER_DELAY_MS arayla
             if (index > STAGGER_START_INDEX) {
               await new Promise(r => setTimeout(r, (index - STAGGER_START_INDEX) * STAGGER_DELAY_MS));
             }
 
-            const tkgmUrl = `https://cbsapi.tkgm.gov.tr/megsiswebapi.v3.1/api/parsel/${coord.lat}/${coord.lon}/`;
-
             try {
-              const response = await fetch(tkgmUrl, {
-                headers: {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                  "Accept": "application/json",
-                  "Referer": "https://parselsorgu.tkgm.gov.tr/",
-                  "Origin": "https://parselsorgu.tkgm.gov.tr"
-                }
-              });
+              const response = await fetchTKGM(`${TKGM_API_V31}/parsel/${coord.lat}/${coord.lon}/`);
 
-              // Detayli status bilgisi
               if (response.ok) {
                 const data = await response.json();
                 if (data && data.properties) {
-                  return {
-                    status: "found",
-                    data: data,
-                    coord: coord
-                  };
+                  return { status: "found", data, coord };
                 }
-                // API 200 dondurdu ama parsel yok
-                return {
-                  status: "empty",
-                  data: null,
-                  coord: coord
-                };
+                return { status: "empty", data: null, coord };
               }
 
-              // HTTP hata kodlari
-              return {
-                status: "error",
-                error: response.status,
-                data: null,
-                coord: coord
-              };
+              return { status: "error", error: response.status, data: null, coord };
             } catch (e) {
-              console.error(`Batch request failed for coord: ${JSON.stringify(coord)}`, e.message);
-              return {
-                status: "error",
-                error: e.message,
-                data: null,
-                coord: coord
-              };
+              return { status: "error", error: e.message, data: null, coord };
             }
           })
         );
 
-        // Istatistikler
         const stats = {
           total: results.length,
           found: results.filter(r => r.status === "found").length,
@@ -159,34 +167,37 @@ export default {
           error: results.filter(r => r.status === "error").length
         };
 
-        return new Response(JSON.stringify({
-          results,
-          stats,
-          // Geriye uyumluluk icin eski format
-          count: results.length,
-          success: stats.found
-        }), {
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
-          }
-        });
-      } catch (error) {
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" }
-        });
+        return jsonResponse({ results, stats, count: results.length, success: stats.found });
       }
-    }
 
-    return new Response(JSON.stringify({
-      message: "TKGM Proxy API",
-      endpoints: {
-        parsel: "GET /parsel/{lat}/{lon}",
-        batch: "POST /batch with {coordinates: [{lat, lon}, ...]}"
-      }
-    }), {
-      headers: { "Content-Type": "application/json" }
-    });
+      // ============================================
+      // ANA SAYFA - API DOKÜMANTASYONU
+      // ============================================
+
+      return jsonResponse({
+        name: "TKGM Proxy API",
+        version: "2.0",
+        endpoints: {
+          // İdari Yapı
+          iller: "GET /iller - Tüm illerin listesi",
+          ilceler: "GET /ilceler/{ilId} - Belirli ilin ilçeleri",
+          mahalleler: "GET /mahalleler/{ilceId} - Belirli ilçenin mahalleleri",
+          parselByAda: "GET /parsel-by-ada/{mahalleId}/{ada}/{parsel} - Ada/Parsel ile sorgu",
+          // Koordinat Sorgu
+          parsel: "GET /parsel/{lat}/{lon} - Koordinat ile parsel sorgu",
+          batch: "POST /batch - Toplu koordinat sorgusu {coordinates: [{lat, lon}, ...]}"
+        },
+        examples: {
+          iller: "/iller",
+          boluIlceleri: "/ilceler/36",
+          mudurnuMahalleleri: "/mahalleler/271",
+          parselByAda: "/parsel-by-ada/134649/101/5",
+          parselByKoordinat: "/parsel/40.123/32.456"
+        }
+      });
+
+    } catch (error) {
+      return jsonResponse({ error: error.message }, 500);
+    }
   },
 };

@@ -1,122 +1,69 @@
-# TKGM Parsel Extractor
+# TKGM Worker
 
-TKGM (Tapu ve Kadastro Genel Mudurlugu) API'sinden belirli bir alan icindeki tum parsel verilerini toplu olarak ceken modern desktop uygulamasi.
+TKGM (Tapu ve Kadastro Genel Müdürlüğü) API Proxy - Cloudflare Worker
 
-![Python](https://img.shields.io/badge/Python-3.9+-blue)
-![PyQt5](https://img.shields.io/badge/PyQt5-Fluent%20UI-green)
-![License](https://img.shields.io/badge/License-MIT-yellow)
+## Özellikler
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mytsx/tkgm-parsel-extractor)
-
-## Ozellikler
-
-- KML dosyasindan alan yukleyebilme
-- Cloudflare Workers ile rate limit bypass
-- **Akilli tarama**: Bulunan parsellerin icindeki noktalar otomatik elenir (10x-50x daha hizli)
-- **Opsiyonel API Key** korumasi
-- Modern Fluent Design arayuz
-- GeoJSON ve KML formatinda export (tum parsel bilgileri dahil)
-- Ilerleme takibi ve log
-- Ayarlari otomatik kaydetme
+- Koordinat ile parsel sorgulama
+- Toplu (batch) parsel sorgulama
+- İl/İlçe/Mahalle listeleri
+- Ada/Parsel numarası ile sorgulama
+- CORS desteği
+- Opsiyonel API Key koruması
 
 ## Kurulum
 
-### 1. Bagimliliklari Yukle
+```bash
+npm install -g wrangler
+wrangler login
+wrangler deploy
+```
+
+## API Endpoint'leri
+
+### Base URL
+```
+https://tkgm-parsel-proxy.<account>.workers.dev
+```
+
+### İdari Yapı
+| Endpoint | Açıklama |
+|----------|----------|
+| `GET /iller` | Tüm illerin listesi |
+| `GET /ilceler/{ilId}` | İlin ilçeleri |
+| `GET /mahalleler/{ilceId}` | İlçenin mahalleleri |
+| `GET /parsel-by-ada/{mahalleId}/{ada}/{parsel}` | Ada/Parsel sorgusu |
+
+### Parsel Sorgulama
+| Endpoint | Açıklama |
+|----------|----------|
+| `GET /parsel/{lat}/{lon}` | Koordinat ile parsel |
+| `POST /batch` | Toplu koordinat sorgusu |
+
+## Örnek Kullanım
 
 ```bash
-pip install -r requirements.txt
+# İl listesi
+curl https://tkgm-parsel-proxy.<account>.workers.dev/iller
+
+# Koordinat ile parsel
+curl https://tkgm-parsel-proxy.<account>.workers.dev/parsel/40.123/32.456
+
+# Batch sorgu
+curl -X POST https://tkgm-parsel-proxy.<account>.workers.dev/batch \
+  -H "Content-Type: application/json" \
+  -d '{"coordinates": [{"lat": 40.1, "lon": 32.4}, {"lat": 40.2, "lon": 32.5}]}'
 ```
 
-### 2. Cloudflare Worker Deploy Et
-
-1. [Cloudflare Dashboard](https://dash.cloudflare.com) > Workers & Pages > Create Worker
-2. `cloudflare-worker.js` icerigini yapistirin
-3. "Save and Deploy" tiklayin
-4. Worker URL'inizi kopyalayin (ornek: `https://tkgm-proxy.xxx.workers.dev`)
-
-### 3. Uygulamayi Calistir
-
-```bash
-python app.py
-```
-
-## Kullanim
-
-1. Worker URL'inizi girin
-2. API Key girin (opsiyonel - bos birakilabilir)
-3. KML dosyanizi secin (taranacak alan)
-4. Grid araligini ayarlayin (kucuk = daha hassas, daha yavas)
-5. "Taramayi Baslat" butonuna basin
-6. Tamamlaninca "Kaydet" ile GeoJSON/KML olarak export edin
-
-## API Key Korumasi (Opsiyonel)
-
-Worker'inizi korumak istiyorsaniz:
-
-### Cloudflare Dashboard'dan:
-1. [Cloudflare Dashboard](https://dash.cloudflare.com) > Workers & Pages
-2. Worker'inizi secin (ornek: `tkgm-proxy`)
-3. **Settings** sekmesine tiklayin
-4. **Variables and Secrets** bolumune gidin
-5. **Add** butonuna basin
-6. Type: **Secret** secin
-7. Variable name: `API_KEY`
-8. Value: Kendiniz belirleyin (ornek: `benim-gizli-anahtarim-123`)
-9. **Save** tiklayin
-
-### Wrangler CLI ile:
-```bash
-npx wrangler secret put API_KEY
-# Sordugunda degerini girin
-```
-
-### Uygulamada:
-Ayni key'i uygulamadaki "API Key" alanina girin.
-
-**Not:** API Key tamamen opsiyoneldir. Eklemezseniz worker herkese acik olur.
-
-> Detayli bilgi: [Cloudflare Workers Secrets Dokumantasyonu](https://developers.cloudflare.com/workers/configuration/secrets/)
-
-## EXE/APP Build
-
-```bash
-pip install pyinstaller
-python build.py
-```
-
-Cikti: `dist/TKGM-Parsel.app` (macOS) veya `dist/TKGM-Parsel.exe` (Windows)
-
-## Dosya Yapisi
+## Dosya Yapısı
 
 ```
-├── app.py                 # Ana desktop uygulamasi (PyQt5 + Fluent)
-├── cloudflare-worker.js   # Cloudflare Worker proxy kodu
-├── tkgm_client.py         # Python API client (CLI kullanim icin)
-├── build.py               # PyInstaller build scripti
-├── requirements.txt       # Python bagimliliklari
-└── KURULUM.md            # Detayli kurulum talimatlari
+├── cloudflare-worker.js  # Ana worker kodu
+├── wrangler.toml         # Wrangler yapılandırması
+├── workers.json          # Worker metadata
+└── workers/              # Ek worker'lar (deprecated)
 ```
-
-## API Endpointleri (Worker)
-
-```
-GET /parsel/{lat}/{lon}    - Tek koordinat sorgulama
-POST /batch                - Toplu koordinat sorgulama
-```
-
-## Yasal Uyari
-
-Bu arac sadece **yasal amaclar** icin kullanilmalidir:
-- Kendi mulklerinizi sorgulama
-- Akademik arastirma
-- Resmi izinli projeler (madencilik, insaat vb.)
-
-TKGM verilerinin ticari kullanimi icin resmi izin alinmasi gerekmektedir.
 
 ## Lisans
 
-MIT License - Detaylar icin [LICENSE](LICENSE) dosyasina bakin.
-
-## Katkida Bulunma
-
-Pull request'ler memnuniyetle karsilanir. Buyuk degisiklikler icin once bir issue acin.
+MIT

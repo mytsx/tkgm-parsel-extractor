@@ -102,15 +102,70 @@ class KMLParser:
 # ==================== TKGM CLIENT ====================
 
 class TKGMClient:
-    """Cloudflare Worker uzerinden TKGM API istemcisi."""
+    """
+    Cloudflare Worker uzerinden TKGM API istemcisi
+    - Multi-worker pool desteği (workers.json'dan okur)
+    - Hedged requests (paralel deneme)
+    - Worker health tracking (cooldown sistemi)
+    - Akıllı paralel sayısı (worker sayısına göre)
+    """
 
-    REQUEST_TIMEOUT = 30       # Tekil istek timeout (saniye)
-    BATCH_REQUEST_TIMEOUT = 120  # Batch istek timeout (saniye)
+    REQUEST_TIMEOUT = 15       # Tekil istek timeout (saniye)
+    BATCH_REQUEST_TIMEOUT = 60  # Batch istek timeout (saniye)
+    COOLDOWN_SECONDS = 300     # 403 alan worker 5 dk cooldown
+    CONFIG_FILE = "workers.json"
 
-    def __init__(self, worker_url: str, api_key: str = None):
-        """Worker URL ve opsiyonel API key ile istemci olusturur."""
-        self.worker_url = worker_url.rstrip('/')
+    @classmethod
+    def from_config(cls, config_path: str = None) -> 'TKGMClient':
+        """workers.json dosyasından client oluşturur."""
+        if config_path is None:
+            # Uygulama dizininde ara
+            config_path = Path(__file__).parent / cls.CONFIG_FILE
+
+        config_path = Path(config_path)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Worker config bulunamadı: {config_path}")
+
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+
+        workers = config.get('workers', [])
+        api_key = config.get('api_key', '')
+
+        if not workers:
+            raise ValueError("workers.json'da worker tanımlı değil")
+
+        return cls(workers=workers, api_key=api_key)
+
+    def __init__(self, workers: list = None, api_key: str = None, worker_url: str = None):
+        """
+        Worker listesi veya URL ile istemci oluşturur.
+        workers: ["url1", "url2", ...] listesi (önerilen)
+        worker_url: Tek URL veya virgülle ayrılmış URL'ler (geriye uyumluluk)
+        """
+        # Worker listesini belirle
+        if workers:
+            self.worker_urls = [u.rstrip('/') for u in workers]
+        elif worker_url:
+            urls = [u.strip().rstrip('/') for u in worker_url.split(',') if u.strip()]
+            self.worker_urls = urls if urls else [worker_url.rstrip('/')]
+        else:
+            raise ValueError("workers veya worker_url gerekli")
+
+        self.worker_url = self.worker_urls[0]  # Geriye uyumluluk
+        self.current_worker_idx = 0
         self.api_key = api_key
+
+        # Akıllı paralel sayısı: worker sayısına göre
+        # 1 worker -> 1, 2-3 worker -> 2, 4+ worker -> 3
+        n = len(self.worker_urls)
+        self.parallel_tries = min(3, max(1, (n + 1) // 2)) if n < 6 else 3
+
+        # Worker health tracking
+        self.worker_cooldown: dict = {}  # {url: cooldown_end_time}
+        self.worker_success: dict = {url: 0 for url in self.worker_urls}
+        self.worker_fail: dict = {url: 0 for url in self.worker_urls}
+
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -119,24 +174,137 @@ class TKGMClient:
         if api_key:
             self.session.headers["X-API-Key"] = api_key
 
-    def get_parsel(self, lat: float, lon: float) -> tuple:
-        """Returns (data, error_code) tuple"""
+    def _get_healthy_workers(self, count: int) -> List[str]:
+        """Sağlıklı worker'lardan count kadar döndürür (round-robin)."""
+        now = time.time()
+        healthy = []
+        checked = 0
+
+        while len(healthy) < count and checked < len(self.worker_urls) * 2:
+            url = self.worker_urls[self.current_worker_idx]
+            self.current_worker_idx = (self.current_worker_idx + 1) % len(self.worker_urls)
+            checked += 1
+
+            # Cooldown kontrolü
+            cooldown_end = self.worker_cooldown.get(url, 0)
+            if now >= cooldown_end:
+                healthy.append(url)
+
+        # Eğer yeterli sağlıklı worker yoksa, cooldown'dakileri de ekle
+        if len(healthy) < count:
+            for url in self.worker_urls:
+                if url not in healthy:
+                    healthy.append(url)
+                if len(healthy) >= count:
+                    break
+
+        return healthy[:count]
+
+    def _mark_worker_success(self, url: str):
+        """Worker başarılı - cooldown'dan çıkar."""
+        self.worker_success[url] = self.worker_success.get(url, 0) + 1
+        if url in self.worker_cooldown:
+            del self.worker_cooldown[url]
+
+    def _mark_worker_fail(self, url: str, is_rate_limit: bool = False):
+        """Worker başarısız - rate limit ise cooldown'a al."""
+        self.worker_fail[url] = self.worker_fail.get(url, 0) + 1
+        if is_rate_limit:
+            self.worker_cooldown[url] = time.time() + self.COOLDOWN_SECONDS
+
+    def get_worker_count(self) -> int:
+        """Toplam worker sayısını döndürür."""
+        return len(self.worker_urls)
+
+    def get_healthy_worker_count(self) -> int:
+        """Sağlıklı (cooldown'da olmayan) worker sayısını döndürür."""
+        now = time.time()
+        return sum(1 for url in self.worker_urls if now >= self.worker_cooldown.get(url, 0))
+
+    def get_worker_stats(self) -> dict:
+        """Worker istatistiklerini döndürür."""
+        now = time.time()
+        return {
+            "total": len(self.worker_urls),
+            "healthy": self.get_healthy_worker_count(),
+            "cooldown": len(self.worker_urls) - self.get_healthy_worker_count(),
+            "success_total": sum(self.worker_success.values()),
+            "fail_total": sum(self.worker_fail.values())
+        }
+
+    def _request_single_worker(self, worker: str, url_path: str, method: str = "GET", payload: dict = None) -> tuple:
+        """Tek worker'a istek at. Returns (response_data, status_code, is_success)"""
         try:
-            url = f"{self.worker_url}/parsel/{lat}/{lon}"
-            response = self.session.get(url, timeout=self.REQUEST_TIMEOUT)
-            if response.status_code == 200:
+            full_url = f"{worker}{url_path}"
+            timeout = self.BATCH_REQUEST_TIMEOUT if method == "POST" else self.REQUEST_TIMEOUT
+
+            if method == "POST":
+                response = self.session.post(full_url, json=payload, timeout=timeout)
+            else:
+                response = self.session.get(full_url, timeout=timeout)
+
+            return response, response.status_code, response.status_code == 200
+        except requests.Timeout:
+            return None, "TIMEOUT", False
+        except requests.RequestException as e:
+            return None, str(e), False
+
+    def _hedged_request(self, url_path: str, method: str = "GET", payload: dict = None) -> tuple:
+        """
+        Hedged request - birden fazla worker'a paralel istek at, ilk başarılıyı döndür.
+        Returns (response, worker_url, status_code)
+        """
+        workers = self._get_healthy_workers(self.parallel_tries)
+
+        with ThreadPoolExecutor(max_workers=self.parallel_tries) as executor:
+            futures = {
+                executor.submit(self._request_single_worker, w, url_path, method, payload): w
+                for w in workers
+            }
+
+            for future in as_completed(futures):
+                worker = futures[future]
+                try:
+                    response, status_code, is_success = future.result()
+
+                    if is_success:
+                        self._mark_worker_success(worker)
+                        # Diğer futures'ları iptal et
+                        for f in futures:
+                            f.cancel()
+                        return response, worker, status_code
+
+                    # Rate limit (403) - cooldown'a al
+                    if status_code == 403:
+                        self._mark_worker_fail(worker, is_rate_limit=True)
+                    else:
+                        self._mark_worker_fail(worker, is_rate_limit=False)
+
+                except Exception:
+                    self._mark_worker_fail(worker, is_rate_limit=False)
+
+        # Hiçbiri başarılı olmadı
+        return None, None, 403
+
+    def get_parsel(self, lat: float, lon: float) -> tuple:
+        """Returns (data, error_code) tuple - hedged request kullanır"""
+        response, worker, status_code = self._hedged_request(f"/parsel/{lat}/{lon}")
+
+        if response and status_code == 200:
+            try:
                 data = response.json()
                 if 'properties' in data:
                     return data, None
-            elif response.status_code == 401:
-                return None, 401
-            return None, response.status_code
-        except requests.RequestException as e:
-            return None, str(e)
+            except Exception:
+                pass
+
+        if status_code == 401:
+            return None, 401
+        return None, status_code
 
     def get_batch(self, coordinates: list) -> tuple:
         """
-        Batch sorgu - birden fazla koordinati tek istekte sorgula
+        Batch sorgu - hedged request ile birden fazla worker dener
         Args:
             coordinates: [(lat, lon), (lat, lon), ...] listesi
         Returns:
@@ -144,70 +312,63 @@ class TKGMClient:
             results_list: [{data}, {data}, ...] veya None'lar
             meta_dict: {"found": N, "empty": M, "error": K, "error_coords": [...]}
         """
-        try:
-            url = f"{self.worker_url}/batch"
-            payload = {
-                "coordinates": [{"lat": c[0], "lon": c[1]} for c in coordinates]
-            }
-            response = self.session.post(url, json=payload, timeout=self.BATCH_REQUEST_TIMEOUT)
+        payload = {"coordinates": [{"lat": c[0], "lon": c[1]} for c in coordinates]}
+        response, worker, status_code = self._hedged_request("/batch", method="POST", payload=payload)
 
-            if response.status_code == 200:
-                data = response.json()
-                results = data.get('results', [])
-                stats = data.get('stats', {})
-
-                # Yeni format kontrolu
-                is_new_format = results and isinstance(results[0], dict) and 'status' in results[0]
-
-                processed = []
-                error_coords = []  # Hata alan koordinatlar (retry icin)
-
-                if is_new_format:
-                    # Yeni format: {"status": "found/empty/error", "data": {...}, "coord": {...}}
-                    for r in results:
-                        status = r.get('status')
-                        if status == 'found':
-                            processed.append(r.get('data'))
-                        elif status == 'error':
-                            processed.append(None)
-                            coord = r.get('coord', {})
-                            error_coords.append((coord.get('lat'), coord.get('lon')))
-                        else:  # empty
-                            processed.append(None)
-
-                    meta = {
-                        "found": stats.get('found', 0),
-                        "empty": stats.get('empty', 0),
-                        "error": stats.get('error', 0),
-                        "error_coords": error_coords
-                    }
-                else:
-                    # Eski format (geriye uyumluluk)
-                    for r in results:
-                        if r and isinstance(r, dict) and 'properties' in r:
-                            processed.append(r)
-                        else:
-                            processed.append(None)
-
-                    found = len([p for p in processed if p])
-                    meta = {
-                        "found": found,
-                        "empty": len(processed) - found,
-                        "error": 0,
-                        "error_coords": []
-                    }
-
-                return processed, meta, None
-
-            if response.status_code == 401:
+        if not response or status_code != 200:
+            if status_code == 401:
                 return None, None, 401
-            if response.status_code == 429:
+            if status_code == 429:
                 return None, {"rate_limited": True}, 429
-            return None, None, response.status_code
-        except requests.Timeout:
-            return None, {"timeout": True}, "TIMEOUT"
-        except requests.RequestException as e:
-            return None, {"error": str(e)}, str(e)
+            return None, None, status_code
+
+        try:
+            data = response.json()
+            results = data.get('results', [])
+            stats = data.get('stats', {})
+
+            # Yeni format kontrolu
+            is_new_format = results and isinstance(results[0], dict) and 'status' in results[0]
+
+            processed = []
+            error_coords = []
+
+            if is_new_format:
+                for r in results:
+                    r_status = r.get('status')
+                    if r_status == 'found':
+                        processed.append(r.get('data'))
+                    elif r_status == 'error':
+                        processed.append(None)
+                        coord = r.get('coord', {})
+                        error_coords.append((coord.get('lat'), coord.get('lon')))
+                    else:
+                        processed.append(None)
+
+                meta = {
+                    "found": stats.get('found', 0),
+                    "empty": stats.get('empty', 0),
+                    "error": stats.get('error', 0),
+                    "error_coords": error_coords
+                }
+            else:
+                for r in results:
+                    if r and isinstance(r, dict) and 'properties' in r:
+                        processed.append(r)
+                    else:
+                        processed.append(None)
+
+                found_count = len([p for p in processed if p])
+                meta = {
+                    "found": found_count,
+                    "empty": len(processed) - found_count,
+                    "error": 0,
+                    "error_coords": []
+                }
+
+            return processed, meta, None
+        except Exception as e:
+            return None, {"error": str(e)}, "PARSE_ERROR"
 
 
 # ==================== QUADTREE ====================
@@ -299,8 +460,11 @@ class ScanWorker(QThread):
     # Batch boyutu (Worker limiti 20)
     BATCH_SIZE = 15
 
-    # Paralel istek sayisi
-    PARALLEL_BATCHES = 5
+    # Paralel istek sayisi (rate limit icin dusuk tutuldu)
+    PARALLEL_BATCHES = 2
+
+    # Batch arasi bekleme suresi (ms)
+    BATCH_DELAY_MS = 200
 
     # Kalite seviyeleri: (kaba_grid, yogun_grid, boundary_step)
     QUALITY_SETTINGS = {
@@ -453,12 +617,13 @@ class ScanWorker(QThread):
                     break
 
                 # Yeni batch'ler ekle (max PARALLEL_BATCHES kadar)
-                # Her batch arasinda kucuk delay (rate limit onleme)
+                # Her batch arasinda delay (rate limit onleme)
                 while batch_idx < len(batches) and len(future_to_batch) < self.PARALLEL_BATCHES:
-                    # 50ms delay between submissions
+                    # BATCH_DELAY_MS delay between submissions
+                    delay_sec = self.BATCH_DELAY_MS / 1000
                     current_time = time.time()
-                    if current_time - last_submit_time < 0.05:
-                        time.sleep(0.05 - (current_time - last_submit_time))
+                    if current_time - last_submit_time < delay_sec:
+                        time.sleep(delay_sec - (current_time - last_submit_time))
 
                     batch = batches[batch_idx]
                     self._mark_as_queried(batch)
@@ -486,9 +651,9 @@ class ScanWorker(QThread):
 
                         # Rate limit veya timeout - retry'a ekle
                         if error == 429 or error == "TIMEOUT":
-                            if retry_count < 2:
+                            if retry_count < 3:
                                 retry_queue.append((batch, retry_count + 1))
-                                self.log.emit(f"  ⚠ Rate limit/timeout, retry kuyruğuna eklendi")
+                                self.log.emit(f"  ⚠ Rate limit/timeout, retry kuyruğuna eklendi (deneme {retry_count + 1})")
                             else:
                                 self.failed_points += len(batch)
                             continue
@@ -499,7 +664,7 @@ class ScanWorker(QThread):
 
                         # Worker'dan gelen hata koordinatlarini retry'a ekle
                         error_coords = meta.get('error_coords', []) if meta else []
-                        if error_coords and retry_count < 2:
+                        if error_coords and retry_count < 3:
                             retry_queue.append((error_coords, retry_count + 1))
                             self.log.emit(f"  ⚠ {len(error_coords)} koordinat hatali, retry'a eklendi")
 
@@ -523,29 +688,48 @@ class ScanWorker(QThread):
                 if not done_futures:
                     time.sleep(0.01)
 
-        # Retry queue'yu isle (rate limit sonrasi)
+        # Retry queue'yu isle (exponential backoff ile)
         if retry_queue and self.is_running:
             self.log.emit(f"  Retry: {len(retry_queue)} batch tekrar deneniyor...")
-            time.sleep(1)  # Rate limit icin bekle
 
-            for batch, _retry_count in retry_queue:
+            # Retry'lari deneme sayisina gore grupla
+            retry_groups = {}  # retry_count -> batches
+            for batch, retry_count in retry_queue:
+                retry_groups.setdefault(retry_count, []).append(batch)
+
+            for retry_count in sorted(retry_groups.keys()):
                 if not self.is_running:
                     break
 
-                time.sleep(0.2)  # Her retry arasinda bekle
-                results, _meta, error = self._query_batch_single(batch)
-                self.api_calls += 1
+                # Exponential backoff: 1s, 2s, 4s
+                wait_time = 2 ** (retry_count - 1)
+                self.log.emit(f"  Retry #{retry_count}: {wait_time}s beklenip {len(retry_groups[retry_count])} batch denenecek...")
+                time.sleep(wait_time)
 
-                if error:
-                    self.failed_points += len(batch)
-                    continue
+                for batch in retry_groups[retry_count]:
+                    if not self.is_running:
+                        break
 
-                for i, result in enumerate(results):
-                    if result and 'properties' in result:
-                        if self._process_result(result, batch[i]):
-                            new_count += 1
-                    else:
-                        self.null_responses += 1
+                    time.sleep(0.3)  # Her retry arasinda bekle
+                    results, meta, error = self._query_batch_single(batch)
+                    self.api_calls += 1
+
+                    if error:
+                        self.failed_points += len(batch)
+                        continue
+
+                    # Hala hata varsa logla ama devam et
+                    still_error = meta.get('error_coords', []) if meta else []
+                    if still_error:
+                        self.failed_points += len(still_error)
+                        self.log.emit(f"    ⚠ {len(still_error)} koordinat hala hatali")
+
+                    for i, result in enumerate(results):
+                        if result and 'properties' in result:
+                            if self._process_result(result, batch[i]):
+                                new_count += 1
+                        else:
+                            self.null_responses += 1
 
         return new_count
 
@@ -664,7 +848,8 @@ class ScanWorker(QThread):
         self.log.emit("=" * 50)
         self.log.emit(f"Kalite: {quality_names[self.quality]}")
         self.log.emit(f"Kaba grid: {self.coarse_step}m, Yogun grid: {self.dense_step}m")
-        self.log.emit(f"Paralel istek: {self.PARALLEL_BATCHES}")
+        self.log.emit(f"Paralel batch: {self.PARALLEL_BATCHES}")
+        self.log.emit(f"Worker sayisi: {self.client.get_worker_count()}")
 
         total_found = 0
 
@@ -838,21 +1023,16 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        # Worker URL Card
-        url_card = CardWidget()
-        url_layout = QVBoxLayout(url_card)
-        url_layout.addWidget(SubtitleLabel("Cloudflare Worker URL"))
-        self.worker_url_input = LineEdit()
-        self.worker_url_input.setPlaceholderText("https://your-worker.workers.dev")
-        url_layout.addWidget(self.worker_url_input)
+        # Worker Durumu Card
+        worker_card = CardWidget()
+        worker_layout = QVBoxLayout(worker_card)
+        worker_layout.addWidget(SubtitleLabel("Worker Durumu"))
+        self.worker_status_label = BodyLabel("workers.json yükleniyor...")
+        worker_layout.addWidget(self.worker_status_label)
+        layout.addWidget(worker_card)
 
-        # API Key (Opsiyonel)
-        url_layout.addWidget(BodyLabel("API Key (Opsiyonel)"))
-        self.api_key_input = LineEdit()
-        self.api_key_input.setPlaceholderText("Bos birakilabilir - Worker herkese acik olur")
-        url_layout.addWidget(self.api_key_input)
-
-        layout.addWidget(url_card)
+        # Worker durumunu kontrol et
+        self._check_worker_config()
 
         # KML Card
         kml_card = CardWidget()
@@ -967,16 +1147,26 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(log_card)
 
+    def _check_worker_config(self):
+        """workers.json dosyasını kontrol eder ve durumu gösterir."""
+        try:
+            client = TKGMClient.from_config()
+            n = client.get_worker_count()
+            self.worker_status_label.setText(
+                f"{n} worker aktif (paralel: {client.parallel_tries})"
+            )
+            self._worker_config_ok = True
+        except FileNotFoundError:
+            self.worker_status_label.setText(
+                "workers.json bulunamadi! Lutfen olusturun."
+            )
+            self._worker_config_ok = False
+        except Exception as e:
+            self.worker_status_label.setText(f"Hata: {str(e)[:50]}")
+            self._worker_config_ok = False
+
     def load_settings(self):
         """Kaydedilmis ayarlari yukler."""
-        url = self.settings.value("worker_url", "")
-        if url:
-            self.worker_url_input.setText(url)
-
-        api_key = self.settings.value("api_key", "")
-        if api_key:
-            self.api_key_input.setText(api_key)
-
         # Kalite ayari
         quality = self.settings.value("quality", 1, type=int)
         if quality == 0:
@@ -988,8 +1178,6 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         """Mevcut ayarlari kaydeder."""
-        self.settings.setValue("worker_url", self.worker_url_input.text())
-        self.settings.setValue("api_key", self.api_key_input.text())
         self.settings.setValue("quality", self.quality_group.checkedId())
 
     def log(self, message: str):
@@ -1067,11 +1255,11 @@ class MainWindow(QMainWindow):
             )
             return
 
-        url = self.worker_url_input.text().strip()
-        if not url or "your-worker" in url:
-            InfoBar.warning(
-                title="Uyari",
-                content="Lutfen Worker URL girin",
+        # Worker config kontrolü
+        if not getattr(self, '_worker_config_ok', False):
+            InfoBar.error(
+                title="Hata",
+                content="workers.json bulunamadi veya hatali!",
                 parent=self,
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=3000
@@ -1081,25 +1269,12 @@ class MainWindow(QMainWindow):
         self.save_settings()
         self.parcels = {}  # Yeni tarama, onceki parselleri temizle
 
-        # API Key uyarisi
-        api_key = self.api_key_input.text().strip()
-        if not api_key:
-            InfoBar.info(
-                title="Bilgi",
-                content="API Key girilmedi - Worker herkese acik",
-                parent=self,
-                position=InfoBarPosition.TOP_RIGHT,
-                duration=3000
-            )
-
         self._start_worker(reuse_parcels=False)
         self.log("Tarama baslatildi...")
 
     def _start_worker(self, reuse_parcels: bool = False, quality: ScanQuality = None):
         """Worker olusturur ve baslatir."""
-        url = self.worker_url_input.text().strip()
-        api_key = self.api_key_input.text().strip() or None
-        client = TKGMClient(url, api_key)
+        client = TKGMClient.from_config()
 
         # Kalite secimi
         if quality is None:
@@ -1209,8 +1384,14 @@ class MainWindow(QMainWindow):
             )
             return
 
-        url = self.worker_url_input.text().strip()
-        if not url:
+        if not self._worker_config_ok:
+            InfoBar.error(
+                title="Hata",
+                content="workers.json yapilandirmasi hatali",
+                parent=self,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=3000
+            )
             return
 
         self.log("\n=== DETAYLANDIRMA TARAMASI ===")
